@@ -34,15 +34,12 @@ export default function Page() {
   const [intervalSec, setIntervalSec] = useState(60);
   const [timeRemaining, setTimeRemaining] = useState(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [showControls, setShowControls] = useState(true);
-
   const [currentUrl, setCurrentUrl] = useState<string | null>(null);
   const currentUrlRef = useRef<string | null>(null);
   const timerRef = useRef<number | null>(null);
   const countdownRef = useRef<number | null>(null);
   const imageContainerRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const mouseTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const [supported, setSupported] = useState(false);
 
@@ -56,20 +53,31 @@ export default function Page() {
     return files[fileIndex] || null;
   }, [files, order, idxInOrder]);
 
+  async function collectImagesRecursive(
+    dir: FileSystemDirectoryHandle,
+    pathPrefix: string
+  ): Promise<FileHandleEntry[]> {
+    const collected: FileHandleEntry[] = [];
+    // @ts-expect-error: values() exists on FileSystemDirectoryHandle but types may be incomplete
+    for await (const entry of dir.values()) {
+      if (entry.kind === "file" && isImageFileName(entry.name)) {
+        collected.push({ name: pathPrefix ? `${pathPrefix}/${entry.name}` : entry.name, handle: entry });
+      } else if (entry.kind === "directory") {
+        const subPath = pathPrefix ? `${pathPrefix}/${entry.name}` : entry.name;
+        const subFiles = await collectImagesRecursive(entry, subPath);
+        collected.push(...subFiles);
+      }
+    }
+    return collected;
+  }
+
   async function pickFolder() {
     try {
       // @ts-expect-error: showDirectoryPicker types exist in newer TS libs; safe in Chromium
       const handle: FileSystemDirectoryHandle = await window.showDirectoryPicker();
       setDirHandle(handle);
 
-      const collected: FileHandleEntry[] = [];
-      // Only scans top-level of selected folder (no subfolders)
-      // @ts-expect-error: values() exists on FileSystemDirectoryHandle but types may be incomplete
-      for await (const entry of handle.values()) {
-        if (entry.kind === "file" && isImageFileName(entry.name)) {
-          collected.push({ name: entry.name, handle: entry });
-        }
-      }
+      const collected = await collectImagesRecursive(handle, "");
 
       if (!collected.length) {
         alert("No images found in that folder. Try a folder with .jpg/.png/.webp etc.");
@@ -83,7 +91,7 @@ export default function Page() {
       setFiles(collected);
       setOrder(shuffle(collected.map((_, i) => i)));
       setIdxInOrder(0);
-      setIsRunning(false);
+      setIsRunning(true);
     } catch (e) {
       console.warn(e);
     }
@@ -244,42 +252,6 @@ export default function Page() {
     };
   }, [files.length, order.length]);
 
-  // Mouse movement detection for showing/hiding controls
-  useEffect(() => {
-    function handleMouseMove() {
-      setShowControls(true);
-      if (mouseTimeoutRef.current) {
-        clearTimeout(mouseTimeoutRef.current);
-      }
-      mouseTimeoutRef.current = setTimeout(() => {
-        setShowControls(false);
-      }, 2000);
-    }
-
-    function handleMouseEnter() {
-      setShowControls(true);
-      if (mouseTimeoutRef.current) {
-        clearTimeout(mouseTimeoutRef.current);
-      }
-    }
-
-    const container = containerRef.current;
-    if (container) {
-      container.addEventListener("mousemove", handleMouseMove);
-      container.addEventListener("mouseenter", handleMouseEnter);
-    }
-
-    return () => {
-      if (container) {
-        container.removeEventListener("mousemove", handleMouseMove);
-        container.removeEventListener("mouseenter", handleMouseEnter);
-      }
-      if (mouseTimeoutRef.current) {
-        clearTimeout(mouseTimeoutRef.current);
-      }
-    };
-  }, []);
-
   // Cleanup object URL on unmount
   useEffect(() => {
     return () => {
@@ -368,9 +340,7 @@ export default function Page() {
               display: "flex",
               alignItems: "baseline",
               gap: 12,
-              opacity: showControls ? 1 : 0,
-              transition: "opacity 0.3s ease",
-              pointerEvents: showControls ? "auto" : "none",
+              opacity: 1,
               position: currentUrl ? "absolute" : "relative",
               top: 0,
               left: 0,
@@ -395,9 +365,7 @@ export default function Page() {
               justifyContent: currentUrl ? "flex-end" : "flex-start",
               marginBottom: currentUrl ? 0 : 20,
               padding: currentUrl ? "20px 20px 0 0" : 0,
-              opacity: showControls ? 1 : 0,
-              transition: "opacity 0.3s ease",
-              pointerEvents: showControls ? "auto" : "none",
+              opacity: 1,
               position: currentUrl ? "absolute" : "relative",
               top: currentUrl ? 0 : "auto",
               right: currentUrl ? 0 : "auto",
