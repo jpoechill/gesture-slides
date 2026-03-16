@@ -2,9 +2,16 @@
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
-const APP_VERSION = "0.1.0";
+const APP_VERSION = "0.2.0";
 
 const VERSION_HISTORY: { version: string; date: string; changes: string[] }[] = [
+  {
+    version: "0.2.0",
+    date: "2025-03-10",
+    changes: [
+      "Persist interval and image-adjust settings in localStorage (restored on load)",
+    ],
+  },
   {
     version: "0.1.0",
     date: "2025-03-10",
@@ -29,6 +36,43 @@ type FileHandleEntry = {
 const IMAGE_EXTS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".avif"]);
 
 const IGNORED_DIRS = new Set(["_Deleted", "z_Deleted"]);
+
+const SETTINGS_STORAGE_KEY = "gesture-slideshow-settings";
+
+const DEFAULT_SETTINGS = {
+  intervalSec: 60,
+  imageScale: 1,
+  imageBrightness: 1,
+  imageContrast: 1,
+  imageRotate: 0,
+  imageFlipH: false,
+  imageFlipV: false,
+  imageGrayscale: 0,
+  imageSaturation: 1,
+  imageBlur: 0,
+  imageOpacity: 1,
+};
+
+function loadStoredSettings(): typeof DEFAULT_SETTINGS {
+  if (typeof window === "undefined") return DEFAULT_SETTINGS;
+  try {
+    const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
+    if (!raw) return DEFAULT_SETTINGS;
+    const parsed = JSON.parse(raw) as Partial<typeof DEFAULT_SETTINGS>;
+    return { ...DEFAULT_SETTINGS, ...parsed };
+  } catch {
+    return DEFAULT_SETTINGS;
+  }
+}
+
+function saveStoredSettings(settings: typeof DEFAULT_SETTINGS) {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+  } catch {
+    // ignore quota or other errors
+  }
+}
 
 function isImageFileName(name: string) {
   const lower = name.toLowerCase();
@@ -133,8 +177,10 @@ export default function Page() {
   const [order, setOrder] = useState<number[]>([]);
   const [idxInOrder, setIdxInOrder] = useState(0);
 
+  const storedSettings = useMemo(() => loadStoredSettings(), []);
+
   const [isRunning, setIsRunning] = useState(false);
-  const [intervalSec, setIntervalSec] = useState(60);
+  const [intervalSec, setIntervalSec] = useState(storedSettings.intervalSec);
   const [timeRemaining, setTimeRemaining] = useState(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [currentUrl, setCurrentUrl] = useState<string | null>(null);
@@ -155,16 +201,16 @@ export default function Page() {
   };
   const [imageMeta, setImageMeta] = useState<ImageMeta>({});
 
-  const [imageScale, setImageScale] = useState(1);
-  const [imageBrightness, setImageBrightness] = useState(1);
-  const [imageContrast, setImageContrast] = useState(1);
-  const [imageRotate, setImageRotate] = useState(0);
-  const [imageFlipH, setImageFlipH] = useState(false);
-  const [imageFlipV, setImageFlipV] = useState(false);
-  const [imageGrayscale, setImageGrayscale] = useState(0);
-  const [imageSaturation, setImageSaturation] = useState(1);
-  const [imageBlur, setImageBlur] = useState(0);
-  const [imageOpacity, setImageOpacity] = useState(1);
+  const [imageScale, setImageScale] = useState(storedSettings.imageScale);
+  const [imageBrightness, setImageBrightness] = useState(storedSettings.imageBrightness);
+  const [imageContrast, setImageContrast] = useState(storedSettings.imageContrast);
+  const [imageRotate, setImageRotate] = useState(storedSettings.imageRotate);
+  const [imageFlipH, setImageFlipH] = useState(storedSettings.imageFlipH);
+  const [imageFlipV, setImageFlipV] = useState(storedSettings.imageFlipV);
+  const [imageGrayscale, setImageGrayscale] = useState(storedSettings.imageGrayscale);
+  const [imageSaturation, setImageSaturation] = useState(storedSettings.imageSaturation);
+  const [imageBlur, setImageBlur] = useState(storedSettings.imageBlur);
+  const [imageOpacity, setImageOpacity] = useState(storedSettings.imageOpacity);
   const [panX, setPanX] = useState(0);
   const [panY, setPanY] = useState(0);
   const [isPanning, setIsPanning] = useState(false);
@@ -184,6 +230,35 @@ export default function Page() {
   useEffect(() => {
     setSupported(typeof window !== "undefined" && "showDirectoryPicker" in window);
   }, []);
+
+  // Persist interval and image settings to localStorage
+  useEffect(() => {
+    saveStoredSettings({
+      intervalSec,
+      imageScale,
+      imageBrightness,
+      imageContrast,
+      imageRotate,
+      imageFlipH,
+      imageFlipV,
+      imageGrayscale,
+      imageSaturation,
+      imageBlur,
+      imageOpacity,
+    });
+  }, [
+    intervalSec,
+    imageScale,
+    imageBrightness,
+    imageContrast,
+    imageRotate,
+    imageFlipH,
+    imageFlipV,
+    imageGrayscale,
+    imageSaturation,
+    imageBlur,
+    imageOpacity,
+  ]);
 
   // Play sound when slide changes (next image)
   useEffect(() => {
