@@ -2,12 +2,33 @@
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
+const APP_VERSION = "0.1.0";
+
+const VERSION_HISTORY: { version: string; date: string; changes: string[] }[] = [
+  {
+    version: "0.1.0",
+    date: "2025-03-10",
+    changes: [
+      "Folder pick, shuffle, auto-advance with configurable interval",
+      "Keyboard: arrows, space (fullscreen); preset intervals 15s–1h",
+      "Left overlay: image metadata (name, path, size, resolution, last modified)",
+      "Right overlay: scale, brightness, contrast, rotate, flip, grayscale, saturation, blur, opacity",
+      "Pinch zoom (acceleratable), pan, scale/position memory across slides",
+      "Full-width progress timer; advance sound on slide change",
+      "Delete moves image to _Deleted; fullscreen keeps header visible",
+      "Landscape images fill height; portrait/landscape fit without cropping",
+    ],
+  },
+];
+
 type FileHandleEntry = {
   name: string;
   handle: FileSystemFileHandle;
 };
 
 const IMAGE_EXTS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".avif"]);
+
+const IGNORED_DIRS = new Set(["_Deleted", "z_Deleted"]);
 
 function isImageFileName(name: string) {
   const lower = name.toLowerCase();
@@ -35,6 +56,25 @@ function touchDistance(
   t2: { clientX: number; clientY: number }
 ): number {
   return Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
+}
+
+function playAdvanceSound() {
+  try {
+    if (typeof window === "undefined" || !window.AudioContext) return;
+    const ctx = new window.AudioContext();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.frequency.value = 520;
+    osc.type = "sine";
+    gain.gain.setValueAtTime(0.12, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.12);
+    osc.start(ctx.currentTime);
+    osc.stop(ctx.currentTime + 0.12);
+  } catch {
+    // ignore if AudioContext not allowed or unavailable
+  }
 }
 
 function MetaRow({ label, value }: { label: string; value: string }) {
@@ -139,10 +179,19 @@ export default function Page() {
   const zoomContainerRef = useRef<HTMLDivElement | null>(null);
   const imageScaleRef = useRef(imageScale);
   imageScaleRef.current = imageScale;
+  const prevIdxInOrderRef = useRef<number | null>(null);
 
   useEffect(() => {
     setSupported(typeof window !== "undefined" && "showDirectoryPicker" in window);
   }, []);
+
+  // Play sound when slide changes (next image)
+  useEffect(() => {
+    if (prevIdxInOrderRef.current !== null && prevIdxInOrderRef.current !== idxInOrder) {
+      playAdvanceSound();
+    }
+    prevIdxInOrderRef.current = idxInOrder;
+  }, [idxInOrder]);
 
   const currentFile = useMemo(() => {
     if (!files.length || !order.length) return null;
@@ -159,7 +208,7 @@ export default function Page() {
     for await (const entry of dir.values()) {
       if (entry.kind === "file" && isImageFileName(entry.name)) {
         collected.push({ name: pathPrefix ? `${pathPrefix}/${entry.name}` : entry.name, handle: entry });
-      } else if (entry.kind === "directory" && entry.name !== "_Deleted") {
+      } else if (entry.kind === "directory" && !IGNORED_DIRS.has(entry.name)) {
         const subPath = pathPrefix ? `${pathPrefix}/${entry.name}` : entry.name;
         const subFiles = await collectImagesRecursive(entry, subPath);
         collected.push(...subFiles);
@@ -546,7 +595,7 @@ export default function Page() {
           textAlign: "center",
         }}>
           <h1 style={{ margin: "0 0 12px", fontSize: 32, fontWeight: 500, opacity: 0.95 }}>
-            Gesture Slideshow
+            Gesture Slideshow <span style={{ fontSize: 18, opacity: 0.7, fontWeight: 400 }}>β {APP_VERSION}</span>
           </h1>
           <p style={{ margin: "0 0 32px", fontSize: 16, opacity: 0.7, lineHeight: 1.5 }}>
             Pick a folder → images shuffle → auto-advance
@@ -579,6 +628,37 @@ export default function Page() {
           >
             Pick Folder
           </button>
+
+          <div
+            style={{
+              marginTop: 40,
+              maxHeight: 220,
+              overflow: "auto",
+              textAlign: "left",
+              width: "100%",
+              maxWidth: 480,
+              padding: "12px 16px",
+              borderRadius: 8,
+              background: "rgba(255,255,255,0.04)",
+              border: "1px solid rgba(255,255,255,0.08)",
+            }}
+          >
+            <div style={{ fontSize: 11, opacity: 0.6, marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.06em" }}>
+              Version history
+            </div>
+            {VERSION_HISTORY.map(({ version, date, changes }) => (
+              <div key={version} style={{ marginBottom: 12 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, opacity: 0.9 }}>
+                  β {version} <span style={{ fontWeight: 400, opacity: 0.6 }}>· {date}</span>
+                </div>
+                <ul style={{ margin: "4px 0 0", paddingLeft: 18, fontSize: 12, opacity: 0.75, lineHeight: 1.45 }}>
+                  {changes.map((c, i) => (
+                    <li key={i}>{c}</li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+          </div>
         </div>
       ) : (
         // Image view with controls (this wrapper goes fullscreen so header stays visible)
@@ -612,7 +692,7 @@ export default function Page() {
             }}
           >
             <h1 style={{ margin: 0, fontSize: 18, fontWeight: 500, opacity: 0.9 }}>
-              Gesture Slideshow
+              Gesture Slideshow <span style={{ fontSize: 14, opacity: 0.6, fontWeight: 400 }}>β {APP_VERSION}</span>
             </h1>
             <span style={{ fontSize: 13, opacity: 0.6 }}>
               Pick a folder → images shuffle → auto-advance
@@ -989,25 +1069,85 @@ export default function Page() {
                 />
               </div>
             </div>
-            {isFullscreen && isRunning && timeRemaining > 0 && (
+            {currentUrl && (
               <div
                 style={{
                   position: "absolute",
-                  top: 20,
-                  right: 20,
-                  padding: "8px 16px",
-                  borderRadius: 8,
-                  background: "rgba(0, 0, 0, 0.7)",
-                  backdropFilter: "blur(8px)",
-                  border: "1px solid rgba(255, 255, 255, 0.2)",
-                  fontSize: 18,
-                  fontWeight: 600,
-                  color: "white",
-                  minWidth: 50,
-                  textAlign: "center",
+                  bottom: 20,
+                  left: 0,
+                  right: 0,
+                  width: "100%",
+                  padding: "0 20px",
+                  boxSizing: "border-box",
+                  zIndex: 10,
                 }}
               >
-                {timeRemaining}s
+                <div
+                  style={{
+                    display: "flex",
+                    gap: 6,
+                    flexWrap: "wrap",
+                    marginBottom: 10,
+                  }}
+                >
+                  {[
+                    [15, "15s"],
+                    [30, "30s"],
+                    [60, "1m"],
+                    [120, "2m"],
+                    [300, "5m"],
+                    [600, "10m"],
+                    [900, "15m"],
+                    [1200, "20m"],
+                    [1800, "30m"],
+                    [3600, "1h"],
+                  ].map(([sec, label]) => (
+                    <button
+                      key={sec}
+                      type="button"
+                      onClick={() => setIntervalSec(sec as number)}
+                      style={{
+                        ...btn(false),
+                        padding: "4px 10px",
+                        fontSize: 12,
+                        opacity: intervalSec === sec ? 1 : 0.8,
+                        borderColor: intervalSec === sec ? "rgba(255,255,255,0.4)" : "rgba(255,255,255,0.12)",
+                      }}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                <div
+                  style={{
+                    height: 8,
+                    borderRadius: 4,
+                    background: "rgba(255,255,255,0.15)",
+                    overflow: "hidden",
+                  }}
+                >
+                  <div
+                    style={{
+                      height: "100%",
+                      width: isRunning && order.length ? `${(timeRemaining / intervalSec) * 100}%` : "100%",
+                      background: "rgba(255,255,255,0.6)",
+                      borderRadius: 4,
+                      transition: "width 1s linear",
+                    }}
+                  />
+                </div>
+                <div
+                  style={{
+                    marginTop: 6,
+                    fontSize: 13,
+                    opacity: 0.85,
+                    textAlign: "center",
+                  }}
+                >
+                  {isRunning && order.length
+                    ? `${timeRemaining}s left · ${intervalSec}s interval`
+                    : "Paused"}
+                </div>
               </div>
             )}
           </div>
