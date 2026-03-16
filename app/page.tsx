@@ -24,6 +24,69 @@ function shuffle<T>(array: T[]) {
   return a;
 }
 
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function touchDistance(
+  t1: { clientX: number; clientY: number },
+  t2: { clientX: number; clientY: number }
+): number {
+  return Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
+}
+
+function MetaRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+      <span style={{ opacity: 0.6, fontSize: 11, textTransform: "uppercase", letterSpacing: "0.04em" }}>
+        {label}
+      </span>
+      <span style={{ opacity: 0.95, wordBreak: "break-all" }}>{value}</span>
+    </div>
+  );
+}
+
+function SliderRow({
+  label,
+  value,
+  min,
+  max,
+  step = 0.01,
+  format = (v: number) => String(v),
+  onChange,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step?: number;
+  format?: (v: number) => string;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <span style={{ opacity: 0.85, fontSize: 12 }}>{label}</span>
+        <span style={{ opacity: 0.7, fontSize: 11 }}>{format(value)}</span>
+      </div>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+        style={{
+          width: "100%",
+          accentColor: "rgba(255,255,255,0.8)",
+        }}
+      />
+    </div>
+  );
+}
+
 export default function Page() {
   const [dirHandle, setDirHandle] = useState<FileSystemDirectoryHandle | null>(null);
   const [files, setFiles] = useState<FileHandleEntry[]>([]);
@@ -39,9 +102,43 @@ export default function Page() {
   const timerRef = useRef<number | null>(null);
   const countdownRef = useRef<number | null>(null);
   const imageContainerRef = useRef<HTMLDivElement | null>(null);
+  const fullscreenContainerRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
 
   const [supported, setSupported] = useState(false);
+
+  type ImageMeta = {
+    fileSize?: number;
+    lastModified?: number;
+    width?: number;
+    height?: number;
+  };
+  const [imageMeta, setImageMeta] = useState<ImageMeta>({});
+
+  const [imageScale, setImageScale] = useState(1);
+  const [imageBrightness, setImageBrightness] = useState(1);
+  const [imageContrast, setImageContrast] = useState(1);
+  const [imageRotate, setImageRotate] = useState(0);
+  const [imageFlipH, setImageFlipH] = useState(false);
+  const [imageFlipV, setImageFlipV] = useState(false);
+  const [imageGrayscale, setImageGrayscale] = useState(0);
+  const [imageSaturation, setImageSaturation] = useState(1);
+  const [imageBlur, setImageBlur] = useState(0);
+  const [imageOpacity, setImageOpacity] = useState(1);
+  const [panX, setPanX] = useState(0);
+  const [panY, setPanY] = useState(0);
+  const [isPanning, setIsPanning] = useState(false);
+  const panStartRef = useRef<{ startX: number; startY: number; startPanX: number; startPanY: number } | null>(null);
+  const hasPannedRef = useRef(false);
+  const pinchRef = useRef<{
+    distance: number;
+    scale: number;
+    lastDistance?: number;
+    lastTime?: number;
+  } | null>(null);
+  const zoomContainerRef = useRef<HTMLDivElement | null>(null);
+  const imageScaleRef = useRef(imageScale);
+  imageScaleRef.current = imageScale;
 
   useEffect(() => {
     setSupported(typeof window !== "undefined" && "showDirectoryPicker" in window);
@@ -62,7 +159,7 @@ export default function Page() {
     for await (const entry of dir.values()) {
       if (entry.kind === "file" && isImageFileName(entry.name)) {
         collected.push({ name: pathPrefix ? `${pathPrefix}/${entry.name}` : entry.name, handle: entry });
-      } else if (entry.kind === "directory") {
+      } else if (entry.kind === "directory" && entry.name !== "_Deleted") {
         const subPath = pathPrefix ? `${pathPrefix}/${entry.name}` : entry.name;
         const subFiles = await collectImagesRecursive(entry, subPath);
         collected.push(...subFiles);
@@ -74,7 +171,7 @@ export default function Page() {
   async function pickFolder() {
     try {
       // @ts-expect-error: showDirectoryPicker types exist in newer TS libs; safe in Chromium
-      const handle: FileSystemDirectoryHandle = await window.showDirectoryPicker();
+      const handle: FileSystemDirectoryHandle = await window.showDirectoryPicker({ mode: "readwrite" });
       setDirHandle(handle);
 
       const collected = await collectImagesRecursive(handle, "");
@@ -114,10 +211,11 @@ export default function Page() {
   }
 
   async function enterFullscreen() {
-    if (!imageContainerRef.current) return;
+    const el = fullscreenContainerRef.current;
+    if (!el) return;
     try {
-      if (imageContainerRef.current.requestFullscreen) {
-        await imageContainerRef.current.requestFullscreen();
+      if (el.requestFullscreen) {
+        await el.requestFullscreen();
       }
     } catch (e) {
       console.warn("Failed to enter fullscreen:", e);
@@ -139,6 +237,52 @@ export default function Page() {
       exitFullscreen();
     } else {
       enterFullscreen();
+    }
+  }
+
+  async function deleteCurrentImage() {
+    if (!currentFile || !dirHandle) return;
+    try {
+      const parts = currentFile.name.split("/").filter(Boolean);
+      const fileName = parts[parts.length - 1];
+      const parentPath = parts.slice(0, -1);
+
+      let parentDir: FileSystemDirectoryHandle = dirHandle;
+      for (const dirName of parentPath) {
+        parentDir = await parentDir.getDirectoryHandle(dirName);
+      }
+
+      const deletedDir = await dirHandle.getDirectoryHandle("_Deleted", { create: true });
+
+      const file = await currentFile.handle.getFile();
+      const blob = await file.arrayBuffer();
+      const newFileHandle = await deletedDir.getFileHandle(fileName, { create: true });
+      const writable = await newFileHandle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+
+      await parentDir.removeEntry(fileName);
+
+      const deletedIdx = files.indexOf(currentFile);
+      const newFiles = files.filter((_, i) => i !== deletedIdx);
+      const newOrder = order
+        .filter((i) => i !== deletedIdx)
+        .map((i) => (i > deletedIdx ? i - 1 : i));
+
+      setFiles(newFiles);
+      setOrder(newOrder);
+      setIdxInOrder((v) => Math.min(v, Math.max(0, newOrder.length - 1)));
+      if (newFiles.length === 0) {
+        if (currentUrlRef.current) {
+          URL.revokeObjectURL(currentUrlRef.current);
+          currentUrlRef.current = null;
+        }
+        setCurrentUrl(null);
+        setIsRunning(false);
+      }
+    } catch (e) {
+      console.warn("Failed to delete:", e);
+      alert("Failed to move file to _Deleted. Make sure you granted read/write permission.");
     }
   }
 
@@ -164,6 +308,13 @@ export default function Page() {
 
       currentUrlRef.current = url;
       setCurrentUrl(url);
+      setImageMeta((prev) => ({
+        ...prev,
+        fileSize: file.size,
+        lastModified: file.lastModified,
+        width: undefined,
+        height: undefined,
+      }));
     }
 
     load();
@@ -171,6 +322,102 @@ export default function Page() {
       cancelled = true;
     };
   }, [currentFile]);
+
+  const MAX_SCALE = 3;
+  const MIN_SCALE = 0.25;
+
+  // Ctrl+wheel zoom (trackpad pinch on desktop) – on full view so it works over overlays too
+  useEffect(() => {
+    if (!currentUrl) return;
+    const el = fullscreenContainerRef.current;
+    if (!el) return;
+    function handleWheel(e: WheelEvent) {
+      if (!e.ctrlKey) return;
+      e.preventDefault();
+      const delta = e.deltaY > 0 ? -0.05 : 0.05;
+      setImageScale((s) => Math.min(MAX_SCALE, Math.max(MIN_SCALE, s + delta)));
+    }
+    el.addEventListener("wheel", handleWheel, { passive: false });
+    return () => el.removeEventListener("wheel", handleWheel);
+  }, [currentUrl]);
+
+  // Two-finger pinch zoom on full view so pinching off the image (e.g. on overlays) still zooms
+  useEffect(() => {
+    if (!currentUrl) return;
+    const el = fullscreenContainerRef.current;
+    if (!el) return;
+    function handleTouchStart(e: TouchEvent) {
+      if (e.touches.length === 2) {
+        pinchRef.current = {
+          distance: touchDistance(e.touches[0], e.touches[1]),
+          scale: imageScaleRef.current,
+        };
+      }
+    }
+    function handleTouchMove(e: TouchEvent) {
+      if (e.touches.length === 2 && pinchRef.current) {
+        e.preventDefault();
+        const dist = touchDistance(e.touches[0], e.touches[1]);
+        const now = performance.now();
+        const pr = pinchRef.current;
+
+        const ratio = dist / pr.distance;
+        const baseSensitivity = 14;
+        let scaleDelta = Math.pow(ratio, baseSensitivity);
+
+        if (pr.lastTime != null && pr.lastDistance != null) {
+          const dt = Math.max(now - pr.lastTime, 1);
+          const velocity = (dist - pr.lastDistance) / dt;
+          const velocityBoost = 1 + Math.min(Math.max(velocity * 0.12, 0), 1.5);
+          scaleDelta *= velocityBoost;
+        }
+
+        pr.lastDistance = dist;
+        pr.lastTime = now;
+
+        const newScale = Math.min(
+          MAX_SCALE,
+          Math.max(MIN_SCALE, pr.scale * scaleDelta)
+        );
+        setImageScale(newScale);
+      }
+    }
+    function handleTouchEnd(e: TouchEvent) {
+      if (e.touches.length < 2) pinchRef.current = null;
+    }
+    el.addEventListener("touchstart", handleTouchStart, { passive: true });
+    el.addEventListener("touchmove", handleTouchMove, { passive: false });
+    el.addEventListener("touchend", handleTouchEnd, { passive: true });
+    el.addEventListener("touchcancel", handleTouchEnd, { passive: true });
+    return () => {
+      el.removeEventListener("touchstart", handleTouchStart);
+      el.removeEventListener("touchmove", handleTouchMove);
+      el.removeEventListener("touchend", handleTouchEnd);
+      el.removeEventListener("touchcancel", handleTouchEnd);
+    };
+  }, [currentUrl]);
+
+  // Pan: global mouse move/up when dragging
+  useEffect(() => {
+    if (!isPanning) return;
+    function handleMouseMove(e: MouseEvent) {
+      if (panStartRef.current) {
+        hasPannedRef.current = true;
+        setPanX(panStartRef.current.startPanX + (e.clientX - panStartRef.current.startX));
+        setPanY(panStartRef.current.startPanY + (e.clientY - panStartRef.current.startY));
+      }
+    }
+    function handleMouseUp() {
+      setIsPanning(false);
+      panStartRef.current = null;
+    }
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", handleMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+  }, [isPanning]);
 
   // Timer logic
   useEffect(() => {
@@ -191,7 +438,7 @@ export default function Page() {
     return () => {
       if (timerRef.current) window.clearInterval(timerRef.current);
     };
-  }, [isRunning, intervalSec, order.length]);
+  }, [isRunning, intervalSec, order.length, idxInOrder]);
 
   // Countdown timer
   useEffect(() => {
@@ -235,6 +482,17 @@ export default function Page() {
   // Keyboard controls
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
+      if (e.key === " ") {
+        e.preventDefault();
+        if (files.length && order.length) {
+          if (document.fullscreenElement) {
+            exitFullscreen();
+          } else {
+            enterFullscreen();
+          }
+        }
+        return;
+      }
       if (!files.length || !order.length) return;
 
       if (e.key === "ArrowLeft") {
@@ -246,9 +504,9 @@ export default function Page() {
       }
     }
 
-    window.addEventListener("keydown", handleKeyDown);
+    document.addEventListener("keydown", handleKeyDown, true);
     return () => {
-      window.removeEventListener("keydown", handleKeyDown);
+      document.removeEventListener("keydown", handleKeyDown, true);
     };
   }, [files.length, order.length]);
 
@@ -323,17 +581,22 @@ export default function Page() {
           </button>
         </div>
       ) : (
-        // Image view with controls
-        <div style={{
-          maxWidth: currentUrl ? "100%" : 1200,
-          width: currentUrl ? "100%" : "auto",
-          margin: currentUrl ? 0 : "0 auto",
-          height: currentUrl ? "100vh" : "auto",
-          minHeight: currentUrl ? "100vh" : "auto",
-          display: "flex",
-          flexDirection: "column",
-          padding: currentUrl ? 0 : 20
-        }}>
+        // Image view with controls (this wrapper goes fullscreen so header stays visible)
+        <div
+          ref={fullscreenContainerRef}
+          style={{
+            maxWidth: currentUrl ? "100%" : 1200,
+            width: currentUrl ? "100%" : "auto",
+            margin: currentUrl ? 0 : "0 auto",
+            height: currentUrl ? "100vh" : "auto",
+            minHeight: currentUrl ? "100vh" : "auto",
+            display: "flex",
+            flexDirection: "column",
+            padding: currentUrl ? 0 : 20,
+            position: "relative",
+            background: "#0b1220",
+          }}
+        >
           <div
             style={{
               padding: currentUrl ? "20px 20px 0" : "0 0 20px",
@@ -400,6 +663,10 @@ export default function Page() {
               ⛶
             </button>
 
+            <button onClick={deleteCurrentImage} disabled={!canRun} style={btn(!canRun)}>
+              Delete
+            </button>
+
             <label style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: 4 }}>
               <span style={{ opacity: 0.7, fontSize: 13 }}>Interval:</span>
               <input
@@ -454,26 +721,274 @@ export default function Page() {
               width: isFullscreen ? "100vw" : "100vw",
               height: isFullscreen ? "100vh" : "100vh",
               flex: 1,
-              display: "grid",
-              placeItems: "center",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
               position: "relative",
             }}
           >
-            <img
-              src={currentUrl}
-              alt={currentFile?.name || "gesture"}
-              onClick={toggleFullscreen}
+            {currentFile && (
+              <div
+                style={{
+                  position: "absolute",
+                  left: 0,
+                  top: 52,
+                  bottom: 0,
+                  width: 280,
+                  padding: "20px 16px",
+                  background: "transparent",
+                  zIndex: 5,
+                  overflow: "auto",
+                  fontSize: 13,
+                  lineHeight: 1.5,
+                }}
+              >
+                <div style={{ fontWeight: 600, marginBottom: 12, opacity: 0.95 }}>
+                  Image info
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  <MetaRow label="File name" value={currentFile.name.split("/").pop() ?? currentFile.name} />
+                  <MetaRow label="Path" value={currentFile.name} />
+                  <MetaRow label="File size" value={imageMeta.fileSize != null ? formatBytes(imageMeta.fileSize) : "—"} />
+                  <MetaRow
+                    label="Resolution"
+                    value={
+                      imageMeta.width != null && imageMeta.height != null
+                        ? `${imageMeta.width} × ${imageMeta.height}`
+                        : "—"
+                    }
+                  />
+                  <MetaRow
+                    label="Last modified"
+                    value={
+                      imageMeta.lastModified != null
+                        ? new Date(imageMeta.lastModified).toLocaleString(undefined, {
+                            dateStyle: "short",
+                            timeStyle: "short",
+                          })
+                        : "—"
+                    }
+                  />
+                </div>
+              </div>
+            )}
+            {currentFile && (
+              <div
+                style={{
+                  position: "absolute",
+                  right: 0,
+                  top: 52,
+                  bottom: 0,
+                  width: 280,
+                  padding: "20px 16px",
+                  background: "transparent",
+                  zIndex: 5,
+                  overflow: "auto",
+                  fontSize: 13,
+                  lineHeight: 1.5,
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 16,
+                }}
+              >
+                <div style={{ fontWeight: 600, marginBottom: 4, opacity: 0.95 }}>
+                  Adjust image
+                </div>
+                <SliderRow
+                  label="Scale"
+                  value={imageScale}
+                  min={0.25}
+                  max={3}
+                  step={0.05}
+                  format={(v) => `${Math.round(v * 100)}%`}
+                  onChange={setImageScale}
+                />
+                <SliderRow
+                  label="Brightness"
+                  value={imageBrightness}
+                  min={0}
+                  max={2}
+                  step={0.05}
+                  format={(v) => `${Math.round(v * 100)}%`}
+                  onChange={setImageBrightness}
+                />
+                <SliderRow
+                  label="Contrast"
+                  value={imageContrast}
+                  min={0}
+                  max={3}
+                  step={0.05}
+                  format={(v) => `${Math.round(v * 100)}%`}
+                  onChange={setImageContrast}
+                />
+                <SliderRow
+                  label="Rotate"
+                  value={imageRotate}
+                  min={0}
+                  max={360}
+                  step={1}
+                  format={(v) => `${v}°`}
+                  onChange={setImageRotate}
+                />
+                <SliderRow
+                  label="Grayscale"
+                  value={imageGrayscale}
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  format={(v) => `${Math.round(v * 100)}%`}
+                  onChange={setImageGrayscale}
+                />
+                <SliderRow
+                  label="Saturation"
+                  value={imageSaturation}
+                  min={0}
+                  max={2}
+                  step={0.05}
+                  format={(v) => `${Math.round(v * 100)}%`}
+                  onChange={setImageSaturation}
+                />
+                <SliderRow
+                  label="Blur"
+                  value={imageBlur}
+                  min={0}
+                  max={10}
+                  step={0.5}
+                  format={(v) => (v === 0 ? "0" : `${v}px`)}
+                  onChange={setImageBlur}
+                />
+                <SliderRow
+                  label="Opacity"
+                  value={imageOpacity}
+                  min={0.2}
+                  max={1}
+                  step={0.05}
+                  format={(v) => `${Math.round(v * 100)}%`}
+                  onChange={setImageOpacity}
+                />
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  <span style={{ opacity: 0.85, fontSize: 12 }}>Flip</span>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+                      <input
+                        type="checkbox"
+                        checked={imageFlipH}
+                        onChange={(e) => setImageFlipH(e.target.checked)}
+                      />
+                      <span style={{ fontSize: 12 }}>Horizontal</span>
+                    </label>
+                    <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+                      <input
+                        type="checkbox"
+                        checked={imageFlipV}
+                        onChange={(e) => setImageFlipV(e.target.checked)}
+                      />
+                      <span style={{ fontSize: 12 }}>Vertical</span>
+                    </label>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setImageScale(1);
+                    setImageBrightness(1);
+                    setImageContrast(1);
+                    setImageRotate(0);
+                    setImageFlipH(false);
+                    setImageFlipV(false);
+                    setImageGrayscale(0);
+                    setImageSaturation(1);
+                    setImageBlur(0);
+                    setImageOpacity(1);
+                    setPanX(0);
+                    setPanY(0);
+                  }}
+                  style={{
+                    marginTop: 8,
+                    padding: "8px 12px",
+                    fontSize: 12,
+                    borderRadius: 6,
+                    border: "1px solid rgba(255,255,255,0.2)",
+                    background: "rgba(255,255,255,0.08)",
+                    color: "white",
+                    cursor: "pointer",
+                  }}
+                >
+                  Reset all
+                </button>
+              </div>
+            )}
+            <div
               style={{
-                maxWidth: "100vw",
-                maxHeight: "100vh",
-                width: "auto",
-                height: "auto",
-                objectFit: "contain",
-                display: "block",
-                background: "black",
-                cursor: "pointer",
+                flex: 1,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                minWidth: 0,
+                minHeight: 0,
+                overflow: "hidden",
+                touchAction: "none",
               }}
-            />
+            >
+              <div
+                ref={zoomContainerRef}
+                style={{
+                  height: "100%",
+                  width: "100%",
+                  maxHeight: "100%",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  transform: `translate(${panX}px, ${panY}px) scale(${imageScale}) rotate(${imageRotate}deg) scaleX(${imageFlipH ? -1 : 1}) scaleY(${imageFlipV ? -1 : 1})`,
+                  cursor: isPanning ? "grabbing" : imageScale > 1 ? "grab" : "pointer",
+                  userSelect: "none",
+                  touchAction: "none",
+                }}
+                onMouseDown={(e) => {
+                  if (e.button !== 0) return;
+                  hasPannedRef.current = false;
+                  setIsPanning(true);
+                  panStartRef.current = {
+                    startX: e.clientX,
+                    startY: e.clientY,
+                    startPanX: panX,
+                    startPanY: panY,
+                  };
+                }}
+              >
+                <img
+                  src={currentUrl}
+                  alt={currentFile?.name || "gesture"}
+                  onClick={() => {
+                    if (hasPannedRef.current) {
+                      hasPannedRef.current = false;
+                      return;
+                    }
+                    toggleFullscreen();
+                  }}
+                  draggable={false}
+                  onLoad={(e) => {
+                    const img = e.currentTarget;
+                    setImageMeta((prev) => ({
+                      ...prev,
+                      width: img.naturalWidth,
+                      height: img.naturalHeight,
+                    }));
+                  }}
+                  style={{
+                    height: "100vh",
+                    width: "auto",
+                    maxWidth: "none",
+                    objectFit: "contain",
+                    objectPosition: "center",
+                    display: "block",
+                    background: "black",
+                    filter: `brightness(${imageBrightness}) contrast(${imageContrast}) grayscale(${imageGrayscale}) saturate(${imageSaturation}) blur(${imageBlur}px)`,
+                    opacity: imageOpacity,
+                  }}
+                />
+              </div>
+            </div>
             {isFullscreen && isRunning && timeRemaining > 0 && (
               <div
                 style={{
