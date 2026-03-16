@@ -2,9 +2,19 @@
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
-const APP_VERSION = "0.2.0";
+const APP_VERSION = "0.3.0";
 
 const VERSION_HISTORY: { version: string; date: string; changes: string[] }[] = [
+  {
+    version: "0.3.0",
+    date: "2025-03-10",
+    changes: [
+      "Total elapsed: cumulative across all sessions (never reset), persisted and restored on load",
+      "Last folder: show date and time when folder was last opened on landing page",
+      "Play/pause button next to total elapsed in bottom bar (works when overlays are hidden)",
+      "Landing page: elements fade in with staggered timing; title slides down on load",
+    ],
+  },
   {
     version: "0.2.0",
     date: "2025-03-10",
@@ -76,6 +86,7 @@ function saveStoredSettings(settings: typeof DEFAULT_SETTINGS) {
 }
 
 const LAST_FOLDER_NAME_KEY = "gesture-slideshow-last-folder-name";
+const LAST_FOLDER_OPENED_AT_KEY = "gesture-slideshow-last-folder-opened-at";
 const IDB_NAME = "gesture-slideshow";
 const IDB_STORE = "handles";
 const IDB_LAST_FOLDER_KEY = "last-folder";
@@ -94,6 +105,25 @@ function setLastFolderName(name: string) {
   try {
     if (name) localStorage.setItem(LAST_FOLDER_NAME_KEY, name);
     else localStorage.removeItem(LAST_FOLDER_NAME_KEY);
+  } catch {}
+}
+
+function getLastFolderOpenedAt(): number | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(LAST_FOLDER_OPENED_AT_KEY);
+    if (raw == null) return null;
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+function setLastFolderOpenedAt(ms: number) {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.setItem(LAST_FOLDER_OPENED_AT_KEY, String(ms));
   } catch {}
 }
 
@@ -255,6 +285,7 @@ export default function Page() {
 
   const [supported, setSupported] = useState(false);
   const [lastFolderName, setLastFolderNameState] = useState("");
+  const [lastFolderOpenedAt, setLastFolderOpenedAtState] = useState<number | null>(null);
 
   type ImageMeta = {
     fileSize?: number;
@@ -323,6 +354,24 @@ export default function Page() {
 
   useEffect(() => {
     setLastFolderNameState(getLastFolderName());
+    setLastFolderOpenedAtState(getLastFolderOpenedAt());
+  }, []);
+
+  // Restore persisted settings from localStorage after mount (hydration fix: server uses defaults)
+  useEffect(() => {
+    const s = loadStoredSettings();
+    setIntervalSec(s.intervalSec);
+    setElapsedSec(s.elapsedSec);
+    setImageScale(s.imageScale);
+    setImageBrightness(s.imageBrightness);
+    setImageContrast(s.imageContrast);
+    setImageRotate(s.imageRotate);
+    setImageFlipH(s.imageFlipH);
+    setImageFlipV(s.imageFlipV);
+    setImageGrayscale(s.imageGrayscale);
+    setImageSaturation(s.imageSaturation);
+    setImageBlur(s.imageBlur);
+    setImageOpacity(s.imageOpacity);
   }, []);
 
   // Persist interval, elapsed, and image settings to localStorage
@@ -388,7 +437,7 @@ export default function Page() {
     return collected;
   }
 
-  async function applyFolder(handle: FileSystemDirectoryHandle, resetElapsed: boolean) {
+  async function applyFolder(handle: FileSystemDirectoryHandle) {
     setDirHandle(handle);
     const collected = await collectImagesRecursive(handle, "");
     if (!collected.length) {
@@ -402,7 +451,6 @@ export default function Page() {
     setFiles(collected);
     setOrder(shuffle(collected.map((_, i) => i)));
     setIdxInOrder(0);
-    if (resetElapsed) setElapsedSec(0);
     setIsRunning(true);
   }
 
@@ -412,12 +460,15 @@ export default function Page() {
       const handle: FileSystemDirectoryHandle = await window.showDirectoryPicker({ mode: "readwrite" });
       try {
         await saveLastFolderHandle(handle);
+        const now = Date.now();
         setLastFolderName(handle.name);
         setLastFolderNameState(handle.name);
+        setLastFolderOpenedAt(now);
+        setLastFolderOpenedAtState(now);
       } catch {
         // IndexedDB or localStorage may be unavailable
       }
-      await applyFolder(handle, true);
+      await applyFolder(handle);
     } catch (e) {
       console.warn(e);
     }
@@ -446,7 +497,11 @@ export default function Page() {
           return;
         }
       }
-      await applyFolder(handle, false);
+      const now = Date.now();
+      setLastFolderOpenedAt(now);
+      setLastFolderOpenedAtState(now);
+      setLastFolderNameState(handle.name);
+      await applyFolder(handle);
     } catch (e) {
       console.warn(e);
       alert("Could not open last folder. It may have been moved. Use Pick Folder instead.");
@@ -820,10 +875,32 @@ export default function Page() {
           padding: 40,
           textAlign: "center",
         }}>
-          <h1 style={{ margin: "0 0 12px", fontSize: 32, fontWeight: 500, opacity: 0.95 }}>
+          <style>{`
+            @keyframes landingFadeIn {
+              from { opacity: 0; }
+              to { opacity: 1; }
+            }
+            @keyframes landingSlideDown {
+              from { opacity: 0; transform: translateY(-20px); }
+              to { opacity: 1; transform: translateY(0); }
+            }
+          `}</style>
+          <h1 style={{
+            margin: "0 0 12px",
+            fontSize: 32,
+            fontWeight: 500,
+            opacity: 0.95,
+            animation: "landingSlideDown 0.55s ease-out 0s both",
+          }}>
             Gesture Slideshow <span style={{ fontSize: 18, opacity: 0.7, fontWeight: 400 }}>β {APP_VERSION}</span>
           </h1>
-          <p style={{ margin: "0 0 32px", fontSize: 16, opacity: 0.7, lineHeight: 1.5 }}>
+          <p style={{
+            margin: "0 0 32px",
+            fontSize: 16,
+            opacity: 0.7,
+            lineHeight: 1.5,
+            animation: "landingFadeIn 0.5s ease-out 0.08s both",
+          }}>
             Pick a folder → images shuffle → auto-advance
           </p>
 
@@ -836,13 +913,21 @@ export default function Page() {
                 marginBottom: 24,
                 fontSize: 14,
                 opacity: 0.8,
+                animation: "landingFadeIn 0.5s ease-out 0.12s both",
               }}
             >
               Your browser doesn't support folder picking. Use Chrome/Edge on desktop.
             </div>
           )}
 
-          <div style={{ display: "flex", gap: 12, flexWrap: "wrap", justifyContent: "center", alignItems: "center" }}>
+          <div style={{
+            display: "flex",
+            gap: 12,
+            flexWrap: "wrap",
+            justifyContent: "center",
+            alignItems: "center",
+            animation: "landingFadeIn 0.5s ease-out 0.16s both",
+          }}>
             <button
               onClick={openLastFolder}
               disabled={!supported || !lastFolderName}
@@ -869,8 +954,24 @@ export default function Page() {
             </button>
           </div>
           {lastFolderName ? (
-            <p style={{ marginTop: 10, fontSize: 13, opacity: 0.65, maxWidth: 400, wordBreak: "break-all" }}>
+            <p style={{
+              marginTop: 10,
+              fontSize: 13,
+              opacity: 0.65,
+              maxWidth: 400,
+              wordBreak: "break-all",
+              animation: "landingFadeIn 0.5s ease-out 0.2s both",
+            }}>
               Last: {lastFolderName}
+              {lastFolderOpenedAt != null ? (
+                <span style={{ opacity: 0.85 }}>
+                  {" — "}
+                  {new Date(lastFolderOpenedAt).toLocaleString(undefined, {
+                    dateStyle: "medium",
+                    timeStyle: "short",
+                  })}
+                </span>
+              ) : null}
             </p>
           ) : null}
 
@@ -886,6 +987,7 @@ export default function Page() {
               borderRadius: 8,
               background: "rgba(255,255,255,0.04)",
               border: "1px solid rgba(255,255,255,0.08)",
+              animation: "landingFadeIn 0.5s ease-out 0.28s both",
             }}
           >
             <div style={{ fontSize: 11, opacity: 0.6, marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.06em" }}>
@@ -1378,12 +1480,29 @@ export default function Page() {
                   </div>
                   <div
                     style={{
-                      fontSize: 13,
-                      opacity: 0.85,
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
                       whiteSpace: "nowrap",
                     }}
                   >
-                    Elapsed {formatElapsed(elapsedSec)}
+                    <button
+                      type="button"
+                      onClick={() => setIsRunning((r) => !r)}
+                      disabled={!canRun}
+                      style={{
+                        ...btn(!canRun),
+                        padding: "4px 8px",
+                        fontSize: 12,
+                        minWidth: 28,
+                      }}
+                      title={isRunning ? "Pause" : "Start"}
+                    >
+                      {isRunning ? "⏸" : "▶"}
+                    </button>
+                    <span style={{ fontSize: 13, opacity: 0.85 }}>
+                      Total elapsed {formatElapsed(elapsedSec)}
+                    </span>
                   </div>
                 </div>
                 <div
