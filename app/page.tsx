@@ -41,6 +41,7 @@ const SETTINGS_STORAGE_KEY = "gesture-slideshow-settings";
 
 const DEFAULT_SETTINGS = {
   intervalSec: 60,
+  elapsedSec: 0,
   imageScale: 1,
   imageBrightness: 1,
   imageContrast: 1,
@@ -74,6 +75,60 @@ function saveStoredSettings(settings: typeof DEFAULT_SETTINGS) {
   }
 }
 
+const LAST_FOLDER_NAME_KEY = "gesture-slideshow-last-folder-name";
+const IDB_NAME = "gesture-slideshow";
+const IDB_STORE = "handles";
+const IDB_LAST_FOLDER_KEY = "last-folder";
+
+function getLastFolderName(): string {
+  if (typeof window === "undefined") return "";
+  try {
+    return localStorage.getItem(LAST_FOLDER_NAME_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function setLastFolderName(name: string) {
+  if (typeof window === "undefined") return;
+  try {
+    if (name) localStorage.setItem(LAST_FOLDER_NAME_KEY, name);
+    else localStorage.removeItem(LAST_FOLDER_NAME_KEY);
+  } catch {}
+}
+
+function openIDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onerror = () => reject(req.error);
+    req.onsuccess = () => resolve(req.result);
+    req.onupgradeneeded = (e) => {
+      const db = (e.target as IDBOpenDBRequest).result;
+      if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE);
+    };
+  });
+}
+
+async function saveLastFolderHandle(handle: FileSystemDirectoryHandle): Promise<void> {
+  const db = await openIDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, "readwrite");
+    tx.objectStore(IDB_STORE).put(handle, IDB_LAST_FOLDER_KEY);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function getLastFolderHandle(): Promise<FileSystemDirectoryHandle | null> {
+  const db = await openIDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, "readonly");
+    const req = tx.objectStore(IDB_STORE).get(IDB_LAST_FOLDER_KEY);
+    req.onsuccess = () => resolve(req.result ?? null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
 function isImageFileName(name: string) {
   const lower = name.toLowerCase();
   for (const ext of IMAGE_EXTS) if (lower.endsWith(ext)) return true;
@@ -93,6 +148,12 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatElapsed(seconds: number): string {
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
 function touchDistance(
@@ -182,6 +243,7 @@ export default function Page() {
   const [isRunning, setIsRunning] = useState(false);
   const [intervalSec, setIntervalSec] = useState(storedSettings.intervalSec);
   const [timeRemaining, setTimeRemaining] = useState(0);
+  const [elapsedSec, setElapsedSec] = useState(storedSettings.elapsedSec);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [currentUrl, setCurrentUrl] = useState<string | null>(null);
   const currentUrlRef = useRef<string | null>(null);
@@ -192,6 +254,7 @@ export default function Page() {
   const containerRef = useRef<HTMLDivElement | null>(null);
 
   const [supported, setSupported] = useState(false);
+  const [lastFolderName, setLastFolderNameState] = useState("");
 
   type ImageMeta = {
     fileSize?: number;
@@ -226,15 +289,47 @@ export default function Page() {
   const imageScaleRef = useRef(imageScale);
   imageScaleRef.current = imageScale;
   const prevIdxInOrderRef = useRef<number | null>(null);
+  const elapsedIntervalRef = useRef<number | null>(null);
+  const [showOverlays, setShowOverlays] = useState(true);
+  const overlayIdleTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     setSupported(typeof window !== "undefined" && "showDirectoryPicker" in window);
   }, []);
 
-  // Persist interval and image settings to localStorage
+  // Hide overlays (except bottom timers) after 45s idle; show again on mouse move
+  useEffect(() => {
+    if (!currentUrl) return;
+    const container = fullscreenContainerRef.current;
+    if (!container) return;
+    const IDLE_MS = 45000;
+    function scheduleHide() {
+      if (overlayIdleTimeoutRef.current) clearTimeout(overlayIdleTimeoutRef.current);
+      overlayIdleTimeoutRef.current = setTimeout(() => setShowOverlays(false), IDLE_MS);
+    }
+    function handleMove() {
+      setShowOverlays(true);
+      scheduleHide();
+    }
+    scheduleHide();
+    container.addEventListener("mousemove", handleMove);
+    container.addEventListener("mouseenter", handleMove);
+    return () => {
+      container.removeEventListener("mousemove", handleMove);
+      container.removeEventListener("mouseenter", handleMove);
+      if (overlayIdleTimeoutRef.current) clearTimeout(overlayIdleTimeoutRef.current);
+    };
+  }, [currentUrl]);
+
+  useEffect(() => {
+    setLastFolderNameState(getLastFolderName());
+  }, []);
+
+  // Persist interval, elapsed, and image settings to localStorage
   useEffect(() => {
     saveStoredSettings({
       intervalSec,
+      elapsedSec,
       imageScale,
       imageBrightness,
       imageContrast,
@@ -248,6 +343,7 @@ export default function Page() {
     });
   }, [
     intervalSec,
+    elapsedSec,
     imageScale,
     imageBrightness,
     imageContrast,
@@ -292,29 +388,68 @@ export default function Page() {
     return collected;
   }
 
+  async function applyFolder(handle: FileSystemDirectoryHandle, resetElapsed: boolean) {
+    setDirHandle(handle);
+    const collected = await collectImagesRecursive(handle, "");
+    if (!collected.length) {
+      alert("No images found in that folder. Try a folder with .jpg/.png/.webp etc.");
+      setFiles([]);
+      setOrder([]);
+      setIdxInOrder(0);
+      setIsRunning(false);
+      return;
+    }
+    setFiles(collected);
+    setOrder(shuffle(collected.map((_, i) => i)));
+    setIdxInOrder(0);
+    if (resetElapsed) setElapsedSec(0);
+    setIsRunning(true);
+  }
+
   async function pickFolder() {
     try {
       // @ts-expect-error: showDirectoryPicker types exist in newer TS libs; safe in Chromium
       const handle: FileSystemDirectoryHandle = await window.showDirectoryPicker({ mode: "readwrite" });
-      setDirHandle(handle);
-
-      const collected = await collectImagesRecursive(handle, "");
-
-      if (!collected.length) {
-        alert("No images found in that folder. Try a folder with .jpg/.png/.webp etc.");
-        setFiles([]);
-        setOrder([]);
-        setIdxInOrder(0);
-        setIsRunning(false);
-        return;
+      try {
+        await saveLastFolderHandle(handle);
+        setLastFolderName(handle.name);
+        setLastFolderNameState(handle.name);
+      } catch {
+        // IndexedDB or localStorage may be unavailable
       }
-
-      setFiles(collected);
-      setOrder(shuffle(collected.map((_, i) => i)));
-      setIdxInOrder(0);
-      setIsRunning(true);
+      await applyFolder(handle, true);
     } catch (e) {
       console.warn(e);
+    }
+  }
+
+  async function openLastFolder() {
+    try {
+      const handle = await getLastFolderHandle();
+      if (!handle) {
+        alert("No previous folder saved. Pick a folder first.");
+        return;
+      }
+      const h = handle as FileSystemDirectoryHandle & {
+        queryPermission?(opts: { mode: string }): Promise<string>;
+        requestPermission?(opts: { mode: string }): Promise<boolean>;
+      };
+      const permission = await h.queryPermission?.({ mode: "readwrite" }).catch(() => "prompt");
+      if (permission === "denied") {
+        alert("Permission to the last folder was denied. Use Pick Folder to choose it again.");
+        return;
+      }
+      if (permission === "prompt") {
+        const granted = await h.requestPermission?.({ mode: "readwrite" }).catch(() => false);
+        if (!granted) {
+          alert("Permission to the last folder is needed. Use Pick Folder to choose it again.");
+          return;
+        }
+      }
+      await applyFolder(handle, false);
+    } catch (e) {
+      console.warn(e);
+      alert("Could not open last folder. It may have been moved. Use Pick Folder instead.");
     }
   }
 
@@ -591,6 +726,22 @@ export default function Page() {
     };
   }, [isRunning, intervalSec, order.length, idxInOrder]);
 
+  // Elapsed time (total seconds since slideshow started)
+  useEffect(() => {
+    if (elapsedIntervalRef.current) {
+      window.clearInterval(elapsedIntervalRef.current);
+      elapsedIntervalRef.current = null;
+    }
+    if (isRunning && order.length) {
+      elapsedIntervalRef.current = window.setInterval(() => {
+        setElapsedSec((e) => e + 1);
+      }, 1000);
+    }
+    return () => {
+      if (elapsedIntervalRef.current) window.clearInterval(elapsedIntervalRef.current);
+    };
+  }, [isRunning, order.length]);
+
   // Fullscreen state tracking
   useEffect(() => {
     function handleFullscreenChange() {
@@ -691,18 +842,37 @@ export default function Page() {
             </div>
           )}
 
-          <button
-            onClick={pickFolder}
-            disabled={!supported}
-            style={{
-              ...btn(!supported),
-              padding: "14px 28px",
-              fontSize: 16,
-              fontWeight: 600,
-            }}
-          >
-            Pick Folder
-          </button>
+          <div style={{ display: "flex", gap: 12, flexWrap: "wrap", justifyContent: "center", alignItems: "center" }}>
+            <button
+              onClick={openLastFolder}
+              disabled={!supported || !lastFolderName}
+              style={{
+                ...btn(!supported || !lastFolderName),
+                padding: "14px 28px",
+                fontSize: 16,
+                fontWeight: 600,
+              }}
+            >
+              Open Last
+            </button>
+            <button
+              onClick={pickFolder}
+              disabled={!supported}
+              style={{
+                ...btn(!supported),
+                padding: "14px 28px",
+                fontSize: 16,
+                fontWeight: 600,
+              }}
+            >
+              Pick Folder
+            </button>
+          </div>
+          {lastFolderName ? (
+            <p style={{ marginTop: 10, fontSize: 13, opacity: 0.65, maxWidth: 400, wordBreak: "break-all" }}>
+              Last: {lastFolderName}
+            </p>
+          ) : null}
 
           <div
             style={{
@@ -758,7 +928,9 @@ export default function Page() {
               display: "flex",
               alignItems: "baseline",
               gap: 12,
-              opacity: 1,
+              opacity: showOverlays ? 1 : 0,
+              pointerEvents: showOverlays ? "auto" : "none",
+              transition: "opacity 0.3s ease",
               position: currentUrl ? "absolute" : "relative",
               top: 0,
               left: 0,
@@ -783,7 +955,9 @@ export default function Page() {
               justifyContent: currentUrl ? "flex-end" : "flex-start",
               marginBottom: currentUrl ? 0 : 20,
               padding: currentUrl ? "20px 20px 0 0" : 0,
-              opacity: 1,
+              opacity: showOverlays ? 1 : 0,
+              pointerEvents: showOverlays ? "auto" : "none",
+              transition: "opacity 0.3s ease",
               position: currentUrl ? "absolute" : "relative",
               top: currentUrl ? 0 : "auto",
               right: currentUrl ? 0 : "auto",
@@ -896,6 +1070,9 @@ export default function Page() {
                   overflow: "auto",
                   fontSize: 13,
                   lineHeight: 1.5,
+                  opacity: showOverlays ? 1 : 0,
+                  pointerEvents: showOverlays ? "auto" : "none",
+                  transition: "opacity 0.3s ease",
                 }}
               >
                 <div style={{ fontWeight: 600, marginBottom: 12, opacity: 0.95 }}>
@@ -944,6 +1121,9 @@ export default function Page() {
                   display: "flex",
                   flexDirection: "column",
                   gap: 16,
+                  opacity: showOverlays ? 1 : 0,
+                  pointerEvents: showOverlays ? "auto" : "none",
+                  transition: "opacity 0.3s ease",
                 }}
               >
                 <div style={{ fontWeight: 600, marginBottom: 4, opacity: 0.95 }}>
@@ -1160,38 +1340,51 @@ export default function Page() {
                 <div
                   style={{
                     display: "flex",
-                    gap: 6,
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: 12,
                     flexWrap: "wrap",
                     marginBottom: 10,
                   }}
                 >
-                  {[
-                    [15, "15s"],
-                    [30, "30s"],
-                    [60, "1m"],
-                    [120, "2m"],
-                    [300, "5m"],
-                    [600, "10m"],
-                    [900, "15m"],
-                    [1200, "20m"],
-                    [1800, "30m"],
-                    [3600, "1h"],
-                  ].map(([sec, label]) => (
-                    <button
-                      key={sec}
-                      type="button"
-                      onClick={() => setIntervalSec(sec as number)}
-                      style={{
-                        ...btn(false),
-                        padding: "4px 10px",
-                        fontSize: 12,
-                        opacity: intervalSec === sec ? 1 : 0.8,
-                        borderColor: intervalSec === sec ? "rgba(255,255,255,0.4)" : "rgba(255,255,255,0.12)",
-                      }}
-                    >
-                      {label}
-                    </button>
-                  ))}
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                    {[
+                      [15, "15s"],
+                      [30, "30s"],
+                      [60, "1m"],
+                      [120, "2m"],
+                      [300, "5m"],
+                      [600, "10m"],
+                      [900, "15m"],
+                      [1200, "20m"],
+                      [1800, "30m"],
+                      [3600, "1h"],
+                    ].map(([sec, label]) => (
+                      <button
+                        key={sec}
+                        type="button"
+                        onClick={() => setIntervalSec(sec as number)}
+                        style={{
+                          ...btn(false),
+                          padding: "4px 10px",
+                          fontSize: 12,
+                          opacity: intervalSec === sec ? 1 : 0.8,
+                          borderColor: intervalSec === sec ? "rgba(255,255,255,0.4)" : "rgba(255,255,255,0.12)",
+                        }}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                  <div
+                    style={{
+                      fontSize: 13,
+                      opacity: 0.85,
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    Elapsed {formatElapsed(elapsedSec)}
+                  </div>
                 </div>
                 <div
                   style={{
