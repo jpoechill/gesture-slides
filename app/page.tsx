@@ -2,9 +2,21 @@
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
-const APP_VERSION = "0.3.0";
+const APP_VERSION = "0.4.0";
 
 const VERSION_HISTORY: { version: string; date: string; changes: string[] }[] = [
+  {
+    version: "0.4.0",
+    date: "2026-03-19",
+    changes: [
+      "Site metadata: title and description for Gesture Slideshow (layout)",
+      "Logo beside title on splash and dashboard; white filter",
+      "Title/logo click returns to splash; reset total elapsed button next to play/pause",
+      "3m interval preset",
+      "Center frame: white square + 25px crosshair + “a” label; adjustable size; hide toggle; always on when shown (not zoom-only)",
+      "Removed image opacity control",
+    ],
+  },
   {
     version: "0.3.0",
     date: "2025-03-10",
@@ -61,7 +73,8 @@ const DEFAULT_SETTINGS = {
   imageGrayscale: 0,
   imageSaturation: 1,
   imageBlur: 0,
-  imageOpacity: 1,
+  showCenterFrame: true,
+  centerFrameSize: 136,
 };
 
 function loadStoredSettings(): typeof DEFAULT_SETTINGS {
@@ -105,7 +118,7 @@ function setLastFolderName(name: string) {
   try {
     if (name) localStorage.setItem(LAST_FOLDER_NAME_KEY, name);
     else localStorage.removeItem(LAST_FOLDER_NAME_KEY);
-  } catch {}
+  } catch { }
 }
 
 function getLastFolderOpenedAt(): number | null {
@@ -124,7 +137,7 @@ function setLastFolderOpenedAt(ms: number) {
   if (typeof window === "undefined") return;
   try {
     localStorage.setItem(LAST_FOLDER_OPENED_AT_KEY, String(ms));
-  } catch {}
+  } catch { }
 }
 
 function openIDB(): Promise<IDBDatabase> {
@@ -304,7 +317,15 @@ export default function Page() {
   const [imageGrayscale, setImageGrayscale] = useState(storedSettings.imageGrayscale);
   const [imageSaturation, setImageSaturation] = useState(storedSettings.imageSaturation);
   const [imageBlur, setImageBlur] = useState(storedSettings.imageBlur);
-  const [imageOpacity, setImageOpacity] = useState(storedSettings.imageOpacity);
+  const [showCenterFrame, setShowCenterFrame] = useState(
+    storedSettings.showCenterFrame !== false
+  );
+  const [centerFrameSize, setCenterFrameSize] = useState(
+    Math.min(
+      480,
+      Math.max(48, Number(storedSettings.centerFrameSize) || 136)
+    )
+  );
   const [panX, setPanX] = useState(0);
   const [panY, setPanY] = useState(0);
   const [isPanning, setIsPanning] = useState(false);
@@ -371,7 +392,10 @@ export default function Page() {
     setImageGrayscale(s.imageGrayscale);
     setImageSaturation(s.imageSaturation);
     setImageBlur(s.imageBlur);
-    setImageOpacity(s.imageOpacity);
+    setShowCenterFrame(s.showCenterFrame !== false);
+    setCenterFrameSize(
+      Math.min(480, Math.max(48, Number(s.centerFrameSize) || 136))
+    );
   }, []);
 
   // Persist interval, elapsed, and image settings to localStorage
@@ -388,7 +412,8 @@ export default function Page() {
       imageGrayscale,
       imageSaturation,
       imageBlur,
-      imageOpacity,
+      showCenterFrame,
+      centerFrameSize,
     });
   }, [
     intervalSec,
@@ -402,7 +427,8 @@ export default function Page() {
     imageGrayscale,
     imageSaturation,
     imageBlur,
-    imageOpacity,
+    showCenterFrame,
+    centerFrameSize,
   ]);
 
   // Play sound when slide changes (next image)
@@ -552,6 +578,16 @@ export default function Page() {
     } else {
       enterFullscreen();
     }
+  }
+
+  function goToLanding() {
+    if (currentUrlRef.current) {
+      URL.revokeObjectURL(currentUrlRef.current);
+      currentUrlRef.current = null;
+    }
+    setCurrentUrl(null);
+    setIsRunning(false);
+    setShowOverlays(true);
   }
 
   async function deleteCurrentImage() {
@@ -885,13 +921,21 @@ export default function Page() {
               to { opacity: 1; transform: translateY(0); }
             }
           `}</style>
-          <h1 style={{
-            margin: "0 0 12px",
-            fontSize: 32,
-            fontWeight: 500,
-            opacity: 0.95,
-            animation: "landingSlideDown 0.55s ease-out 0s both",
-          }}>
+          <h1
+            onClick={goToLanding}
+            style={{
+              margin: "0 0 12px",
+              fontSize: 32,
+              fontWeight: 500,
+              opacity: 0.95,
+              animation: "landingSlideDown 0.55s ease-out 0s both",
+              cursor: "pointer",
+              display: "flex",
+              alignItems: "center",
+              gap: 12,
+            }}
+          >
+            <img src="/logo.png" alt="" style={{ height: 32, width: "auto", display: "block", filter: "brightness(0) invert(1)" }} />
             Gesture Slideshow <span style={{ fontSize: 18, opacity: 0.7, fontWeight: 400 }}>β {APP_VERSION}</span>
           </h1>
           <p style={{
@@ -1040,12 +1084,22 @@ export default function Page() {
               zIndex: 10,
             }}
           >
-            <h1 style={{ margin: 0, fontSize: 18, fontWeight: 500, opacity: 0.9 }}>
+            <h1
+              onClick={goToLanding}
+              style={{
+                margin: 0,
+                fontSize: 18,
+                fontWeight: 500,
+                opacity: 0.9,
+                cursor: "pointer",
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+              }}
+            >
+              <img src="/logo.png" alt="" style={{ height: 18, width: "auto", display: "block", filter: "brightness(0) invert(1)" }} />
               Gesture Slideshow <span style={{ fontSize: 14, opacity: 0.6, fontWeight: 400 }}>β {APP_VERSION}</span>
             </h1>
-            <span style={{ fontSize: 13, opacity: 0.6 }}>
-              Pick a folder → images shuffle → auto-advance
-            </span>
           </div>
 
           <div
@@ -1098,39 +1152,6 @@ export default function Page() {
               Delete
             </button>
 
-            <label style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: 4 }}>
-              <span style={{ opacity: 0.7, fontSize: 13 }}>Interval:</span>
-              <input
-                type="number"
-                min={1}
-                value={intervalSec}
-                onChange={(e) => setIntervalSec(parseInt(e.target.value || "60", 10))}
-                style={{
-                  width: 60,
-                  padding: "6px 8px",
-                  borderRadius: 6,
-                  border: "1px solid rgba(255,255,255,0.15)",
-                  background: "rgba(255,255,255,0.05)",
-                  color: "white",
-                  fontSize: 13,
-                }}
-              />
-              <span style={{ opacity: 0.7, fontSize: 13 }}>s</span>
-            </label>
-
-            {isRunning && timeRemaining > 0 && (
-              <div
-                style={{
-                  padding: "4px 10px",
-                  borderRadius: 6,
-                  background: "rgba(255,255,255,0.08)",
-                  fontSize: 13,
-                  opacity: 0.9,
-                }}
-              >
-                {timeRemaining}s
-              </div>
-            )}
 
             <div style={{ marginLeft: "auto", opacity: 0.7, fontSize: 13 }}>
               {files.length ? (
@@ -1197,9 +1218,9 @@ export default function Page() {
                     value={
                       imageMeta.lastModified != null
                         ? new Date(imageMeta.lastModified).toLocaleString(undefined, {
-                            dateStyle: "short",
-                            timeStyle: "short",
-                          })
+                          dateStyle: "short",
+                          timeStyle: "short",
+                        })
                         : "—"
                     }
                   />
@@ -1231,6 +1252,33 @@ export default function Page() {
                 <div style={{ fontWeight: 600, marginBottom: 4, opacity: 0.95 }}>
                   Adjust image
                 </div>
+                <label
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    cursor: "pointer",
+                    marginBottom: 8,
+                    fontSize: 12,
+                    opacity: 0.9,
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={!showCenterFrame}
+                    onChange={(e) => setShowCenterFrame(!e.target.checked)}
+                  />
+                  <span>Hide center frame</span>
+                </label>
+                <SliderRow
+                  label="Frame size"
+                  value={centerFrameSize}
+                  min={48}
+                  max={480}
+                  step={4}
+                  format={(v) => `${Math.round(v)}px`}
+                  onChange={setCenterFrameSize}
+                />
                 <SliderRow
                   label="Scale"
                   value={imageScale}
@@ -1294,15 +1342,6 @@ export default function Page() {
                   format={(v) => (v === 0 ? "0" : `${v}px`)}
                   onChange={setImageBlur}
                 />
-                <SliderRow
-                  label="Opacity"
-                  value={imageOpacity}
-                  min={0.2}
-                  max={1}
-                  step={0.05}
-                  format={(v) => `${Math.round(v * 100)}%`}
-                  onChange={setImageOpacity}
-                />
                 <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                   <span style={{ opacity: 0.85, fontSize: 12 }}>Flip</span>
                   <div style={{ display: "flex", gap: 8 }}>
@@ -1336,7 +1375,6 @@ export default function Page() {
                     setImageGrayscale(0);
                     setImageSaturation(1);
                     setImageBlur(0);
-                    setImageOpacity(1);
                     setPanX(0);
                     setPanY(0);
                   }}
@@ -1421,11 +1459,71 @@ export default function Page() {
                     display: "block",
                     background: "black",
                     filter: `brightness(${imageBrightness}) contrast(${imageContrast}) grayscale(${imageGrayscale}) saturate(${imageSaturation}) blur(${imageBlur}px)`,
-                    opacity: imageOpacity,
                   }}
                 />
               </div>
             </div>
+            {currentUrl && showCenterFrame && (
+              <div
+                aria-hidden
+                style={{
+                  position: "absolute",
+                  inset: 0,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  pointerEvents: "none",
+                  zIndex: 3,
+                }}
+              >
+                <svg
+                  width={centerFrameSize}
+                  height={centerFrameSize}
+                  viewBox={`0 0 ${centerFrameSize} ${centerFrameSize}`}
+                  style={{ flexShrink: 0 }}
+                >
+                  <rect
+                    x={3}
+                    y={3}
+                    width={Math.max(4, centerFrameSize - 6)}
+                    height={Math.max(4, centerFrameSize - 6)}
+                    fill="none"
+                    stroke="#ffffff"
+                    strokeWidth={6}
+                  />
+                  <text
+                    x={11}
+                    y={9}
+                    fill="#ffffff"
+                    fontSize={Math.max(7, Math.min(22, centerFrameSize * 0.12))}
+                    fontFamily='system-ui, -apple-system, sans-serif'
+                    fontWeight={600}
+                    dominantBaseline="hanging"
+                  >
+                    a
+                  </text>
+                  {/* 25×25 px crosshair at center */}
+                  <line
+                    x1={centerFrameSize / 2 - 12.5}
+                    y1={centerFrameSize / 2}
+                    x2={centerFrameSize / 2 + 12.5}
+                    y2={centerFrameSize / 2}
+                    stroke="#ffffff"
+                    strokeWidth={2}
+                    strokeLinecap="square"
+                  />
+                  <line
+                    x1={centerFrameSize / 2}
+                    y1={centerFrameSize / 2 - 12.5}
+                    x2={centerFrameSize / 2}
+                    y2={centerFrameSize / 2 + 12.5}
+                    stroke="#ffffff"
+                    strokeWidth={2}
+                    strokeLinecap="square"
+                  />
+                </svg>
+              </div>
+            )}
             {currentUrl && (
               <div
                 style={{
@@ -1455,6 +1553,7 @@ export default function Page() {
                       [30, "30s"],
                       [60, "1m"],
                       [120, "2m"],
+                      [180, "3m"],
                       [300, "5m"],
                       [600, "10m"],
                       [900, "15m"],
@@ -1499,6 +1598,21 @@ export default function Page() {
                       title={isRunning ? "Pause" : "Start"}
                     >
                       {isRunning ? "⏸" : "▶"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setElapsedSec(0)}
+                      disabled={!canRun}
+                      style={{
+                        ...btn(!canRun),
+                        padding: "4px 8px",
+                        fontSize: 12,
+                        minWidth: 28,
+                        opacity: 0.85,
+                      }}
+                      title="Reset total elapsed"
+                    >
+                      ↺
                     </button>
                     <span style={{ fontSize: 13, opacity: 0.85 }}>
                       Total elapsed {formatElapsed(elapsedSec)}
