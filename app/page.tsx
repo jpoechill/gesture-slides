@@ -9,12 +9,9 @@ const VERSION_HISTORY: { version: string; date: string; changes: string[] }[] = 
     version: "0.4.0",
     date: "2026-03-19",
     changes: [
-      "Site metadata: title and description for Gesture Slideshow (layout)",
-      "Logo beside title on splash and dashboard; white filter",
-      "Title/logo click returns to splash; reset total elapsed button next to play/pause",
-      "3m interval preset",
-      "Center frame: white square + 25px crosshair + “a” label; adjustable size; hide toggle; always on when shown (not zoom-only)",
-      "Removed image opacity control",
+      "Layout/metadata, logo + splash/dashboard, title → home, total-elapsed reset near transport",
+      "Center frame (square, crosshair, “a”, size/hide); 3m loop preset; image opacity removed",
+      "Classic: 30s×20, 1m×10, 3m×10, 5m×10, 10m×5 — pick active tier; slot-based progress",
     ],
   },
   {
@@ -55,6 +52,76 @@ type FileHandleEntry = {
   handle: FileSystemFileHandle;
 };
 
+type TimerMode = "classic" | "loop";
+
+function parseTimerMode(v: unknown): TimerMode {
+  return v === "classic" ? "classic" : "loop";
+}
+
+/** Classic: each tier has a slot budget; the selected preset is the active interval; one completion = −1 on that tier. */
+const CLASSIC_PRESETS = [
+  { sec: 30, slots: 20, shortLabel: "30s" },
+  { sec: 60, slots: 10, shortLabel: "1m" },
+  { sec: 180, slots: 10, shortLabel: "3m" },
+  { sec: 300, slots: 10, shortLabel: "5m" },
+  { sec: 600, slots: 5, shortLabel: "10m" },
+] as const;
+
+type ClassicTierSec = (typeof CLASSIC_PRESETS)[number]["sec"];
+type ClassicSlots = Record<ClassicTierSec, number>;
+
+const CLASSIC_TIER_SEC = CLASSIC_PRESETS.map((p) => p.sec) as readonly ClassicTierSec[];
+const CLASSIC_TIER_SET = new Set<number>(CLASSIC_TIER_SEC);
+
+function isClassicTierSec(n: number): n is ClassicTierSec {
+  return CLASSIC_TIER_SET.has(n);
+}
+
+const CLASSIC_SLOTS_INITIAL: ClassicSlots = Object.fromEntries(
+  CLASSIC_PRESETS.map((p) => [p.sec, p.slots])
+) as ClassicSlots;
+
+const CLASSIC_STEP_TOTAL = CLASSIC_PRESETS.reduce((sum, p) => sum + p.slots, 0);
+const CLASSIC_FIRST_TIER = CLASSIC_PRESETS[0]!.sec;
+const CLASSIC_EXHAUSTED_PLACEHOLDER_SEC = CLASSIC_PRESETS[CLASSIC_PRESETS.length - 1]!.sec;
+
+function classicSlotsRemainingTotal(s: ClassicSlots): number {
+  let n = 0;
+  for (const t of CLASSIC_TIER_SEC) n += s[t];
+  return n;
+}
+
+function classicSlotsExhausted(s: ClassicSlots): boolean {
+  return classicSlotsRemainingTotal(s) === 0;
+}
+
+function classicCompletedCount(s: ClassicSlots): number {
+  return CLASSIC_STEP_TOTAL - classicSlotsRemainingTotal(s);
+}
+
+function classicIntervalButtonLabels(slots: ClassicSlots): { sec: number; label: string }[] {
+  return CLASSIC_PRESETS.map((p) => ({
+    sec: p.sec,
+    label: `${p.shortLabel} x ${slots[p.sec]}`,
+  }));
+}
+
+const CLASSIC_MODE_TOOLTIP = `Classic: ${CLASSIC_PRESETS.map((p) => `${p.slots}×${p.shortLabel}`).join(", ")} — click a preset for the timer; each finished interval uses one slot on that tier. Session ends when every tier is 0. Loop: one interval for all slides.`;
+
+const LOOP_INTERVAL_PRESETS: [number, string][] = [
+  [15, "15s"],
+  [30, "30s"],
+  [60, "1m"],
+  [120, "2m"],
+  [180, "3m"],
+  [300, "5m"],
+  [600, "10m"],
+  [900, "15m"],
+  [1200, "20m"],
+  [1800, "30m"],
+  [3600, "1h"],
+];
+
 const IMAGE_EXTS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".avif"]);
 
 const IGNORED_DIRS = new Set(["_Deleted", "z_Deleted"]);
@@ -75,6 +142,8 @@ const DEFAULT_SETTINGS = {
   imageBlur: 0,
   showCenterFrame: true,
   centerFrameSize: 136,
+  centerFrameLabelSize: 50,
+  timerMode: "loop" as TimerMode,
 };
 
 function loadStoredSettings(): typeof DEFAULT_SETTINGS {
@@ -280,17 +349,26 @@ export default function Page() {
   const [files, setFiles] = useState<FileHandleEntry[]>([]);
   const [order, setOrder] = useState<number[]>([]);
   const [idxInOrder, setIdxInOrder] = useState(0);
+  /** Always matches idxInOrder so interval callbacks can compute advance synchronously (React may defer setState updaters). */
+  const idxInOrderRef = useRef(0);
+  idxInOrderRef.current = idxInOrder;
 
   const storedSettings = useMemo(() => loadStoredSettings(), []);
 
   const [isRunning, setIsRunning] = useState(false);
   const [intervalSec, setIntervalSec] = useState(storedSettings.intervalSec);
+  const [timerMode, setTimerMode] = useState<TimerMode>(parseTimerMode(storedSettings.timerMode));
+  /** Remaining classic slot counts per tier; each completed interval decrements the tier that was active. */
+  const [classicSlots, setClassicSlots] = useState<ClassicSlots>(() => ({ ...CLASSIC_SLOTS_INITIAL }));
+  const prevTimerModeRef = useRef<TimerMode>(parseTimerMode(storedSettings.timerMode));
   const [timeRemaining, setTimeRemaining] = useState(0);
   const [elapsedSec, setElapsedSec] = useState(storedSettings.elapsedSec);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [currentUrl, setCurrentUrl] = useState<string | null>(null);
   const currentUrlRef = useRef<string | null>(null);
   const timerRef = useRef<number | null>(null);
+  /** Tier (seconds) for the auto-advance interval currently scheduled — used when a classic slot completes. */
+  const classicAdvanceTierRef = useRef<ClassicTierSec>(CLASSIC_FIRST_TIER);
   const countdownRef = useRef<number | null>(null);
   const imageContainerRef = useRef<HTMLDivElement | null>(null);
   const fullscreenContainerRef = useRef<HTMLDivElement | null>(null);
@@ -326,6 +404,27 @@ export default function Page() {
       Math.max(48, Number(storedSettings.centerFrameSize) || 136)
     )
   );
+  const [centerFrameLabelSize, setCenterFrameLabelSize] = useState(
+    Math.min(
+      300,
+      Math.max(8, Number(storedSettings.centerFrameLabelSize) || 50)
+    )
+  );
+  const lettraDisplayPx = useMemo(
+    () =>
+      Math.max(
+        6,
+        Math.min(centerFrameLabelSize, Math.max(8, centerFrameSize - 20))
+      ),
+    [centerFrameLabelSize, centerFrameSize]
+  );
+
+  const effectiveIntervalSec = useMemo(() => {
+    if (timerMode !== "classic") return intervalSec;
+    if (classicSlotsExhausted(classicSlots)) return CLASSIC_EXHAUSTED_PLACEHOLDER_SEC;
+    if (isClassicTierSec(intervalSec) && classicSlots[intervalSec] > 0) return intervalSec;
+    return CLASSIC_TIER_SEC.find((t) => classicSlots[t] > 0) ?? CLASSIC_FIRST_TIER;
+  }, [timerMode, intervalSec, classicSlots]);
   const [panX, setPanX] = useState(0);
   const [panY, setPanY] = useState(0);
   const [isPanning, setIsPanning] = useState(false);
@@ -378,6 +477,25 @@ export default function Page() {
     setLastFolderOpenedAtState(getLastFolderOpenedAt());
   }, []);
 
+  useEffect(() => {
+    if (prevTimerModeRef.current === "loop" && timerMode === "classic") {
+      setClassicSlots({ ...CLASSIC_SLOTS_INITIAL });
+      setIntervalSec(CLASSIC_FIRST_TIER);
+    }
+    if (prevTimerModeRef.current === "classic" && timerMode === "loop") {
+      setClassicSlots({ ...CLASSIC_SLOTS_INITIAL });
+    }
+    prevTimerModeRef.current = timerMode;
+  }, [timerMode]);
+
+  // Classic: if the selected tier just hit 0, move selection to the next tier with slots.
+  useEffect(() => {
+    if (timerMode !== "classic" || classicSlotsExhausted(classicSlots)) return;
+    if (isClassicTierSec(intervalSec) && classicSlots[intervalSec] > 0) return;
+    const next = CLASSIC_TIER_SEC.find((t) => classicSlots[t] > 0);
+    if (next !== undefined) setIntervalSec(next);
+  }, [timerMode, intervalSec, classicSlots]);
+
   // Restore persisted settings from localStorage after mount (hydration fix: server uses defaults)
   useEffect(() => {
     const s = loadStoredSettings();
@@ -396,6 +514,10 @@ export default function Page() {
     setCenterFrameSize(
       Math.min(480, Math.max(48, Number(s.centerFrameSize) || 136))
     );
+    setCenterFrameLabelSize(
+      Math.min(300, Math.max(8, Number(s.centerFrameLabelSize) || 50))
+    );
+    setTimerMode(parseTimerMode(s.timerMode));
   }, []);
 
   // Persist interval, elapsed, and image settings to localStorage
@@ -414,6 +536,8 @@ export default function Page() {
       imageBlur,
       showCenterFrame,
       centerFrameSize,
+      centerFrameLabelSize,
+      timerMode,
     });
   }, [
     intervalSec,
@@ -429,6 +553,8 @@ export default function Page() {
     imageBlur,
     showCenterFrame,
     centerFrameSize,
+    centerFrameLabelSize,
+    timerMode,
   ]);
 
   // Play sound when slide changes (next image)
@@ -471,12 +597,14 @@ export default function Page() {
       setFiles([]);
       setOrder([]);
       setIdxInOrder(0);
+      setClassicSlots({ ...CLASSIC_SLOTS_INITIAL });
       setIsRunning(false);
       return;
     }
     setFiles(collected);
     setOrder(shuffle(collected.map((_, i) => i)));
     setIdxInOrder(0);
+    setClassicSlots({ ...CLASSIC_SLOTS_INITIAL });
     setIsRunning(true);
   }
 
@@ -538,6 +666,7 @@ export default function Page() {
     if (!files.length) return;
     setOrder(shuffle(files.map((_, i) => i)));
     setIdxInOrder(0);
+    setClassicSlots({ ...CLASSIC_SLOTS_INITIAL });
   }
 
   function next() {
@@ -777,10 +906,40 @@ export default function Page() {
     }
 
     if (isRunning && order.length) {
-      setTimeRemaining(intervalSec);
+      if (timerMode === "classic") {
+        classicAdvanceTierRef.current = effectiveIntervalSec as ClassicTierSec;
+      }
+      setTimeRemaining(effectiveIntervalSec);
       timerRef.current = window.setInterval(() => {
-        setIdxInOrder((v) => (v + 1) % order.length);
-      }, Math.max(1, intervalSec) * 1000);
+        const v = idxInOrderRef.current;
+        if (!order.length) return;
+        let advanced = false;
+        let next = v;
+        if (timerMode === "loop") {
+          advanced = true;
+          next = (v + 1) % order.length;
+        } else if (order.length <= 1) {
+          advanced = true;
+          next = v;
+        } else if (v >= order.length - 1) {
+          next = v;
+        } else {
+          advanced = true;
+          next = v + 1;
+        }
+        setIdxInOrder(next);
+        if (timerMode === "classic" && advanced) {
+          const tier = classicAdvanceTierRef.current;
+          if (isClassicTierSec(tier)) {
+            setClassicSlots((prev) => {
+              if (prev[tier] <= 0) return prev;
+              const nextSlots: ClassicSlots = { ...prev, [tier]: prev[tier] - 1 };
+              if (classicSlotsExhausted(nextSlots)) setIsRunning(false);
+              return nextSlots;
+            });
+          }
+        }
+      }, Math.max(1, effectiveIntervalSec) * 1000);
     } else {
       setTimeRemaining(0);
     }
@@ -788,7 +947,7 @@ export default function Page() {
     return () => {
       if (timerRef.current) window.clearInterval(timerRef.current);
     };
-  }, [isRunning, intervalSec, order.length, idxInOrder]);
+  }, [isRunning, effectiveIntervalSec, order.length, idxInOrder, timerMode, classicSlots]);
 
   // Countdown timer
   useEffect(() => {
@@ -799,11 +958,11 @@ export default function Page() {
 
     if (isRunning && order.length) {
       // Reset timer when image changes or when starting
-      setTimeRemaining(intervalSec);
+      setTimeRemaining(effectiveIntervalSec);
       countdownRef.current = window.setInterval(() => {
         setTimeRemaining((prev) => {
           if (prev <= 1) {
-            return intervalSec;
+            return effectiveIntervalSec;
           }
           return prev - 1;
         });
@@ -815,7 +974,7 @@ export default function Page() {
     return () => {
       if (countdownRef.current) window.clearInterval(countdownRef.current);
     };
-  }, [isRunning, intervalSec, order.length, idxInOrder]);
+  }, [isRunning, effectiveIntervalSec, order.length, idxInOrder, timerMode, classicSlots]);
 
   // Elapsed time (total seconds since slideshow started)
   useEffect(() => {
@@ -1126,7 +1285,17 @@ export default function Page() {
               {dirHandle ? "Change Folder" : "Pick Folder"}
             </button>
 
-            <button onClick={() => setIsRunning(true)} disabled={!canRun} style={btn(!canRun)}>
+            <button
+              onClick={() => {
+                if (timerMode === "classic" && classicSlotsExhausted(classicSlots)) {
+                  setClassicSlots({ ...CLASSIC_SLOTS_INITIAL });
+                  setIntervalSec(CLASSIC_FIRST_TIER);
+                }
+                setIsRunning(true);
+              }}
+              disabled={!canRun}
+              style={btn(!canRun)}
+            >
               Start
             </button>
             <button onClick={() => setIsRunning(false)} disabled={!canRun} style={btn(!canRun)}>
@@ -1225,6 +1394,74 @@ export default function Page() {
                     }
                   />
                 </div>
+                <div
+                  style={{
+                    marginTop: 16,
+                    paddingTop: 16,
+                    borderTop: "1px solid rgba(255,255,255,0.1)",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 12,
+                  }}
+                >
+                  <div style={{ fontWeight: 600, opacity: 0.95, fontSize: 12 }}>Center frame & flip</div>
+                  <label
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      cursor: "pointer",
+                      fontSize: 12,
+                      opacity: 0.9,
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={!showCenterFrame}
+                      onChange={(e) => setShowCenterFrame(!e.target.checked)}
+                    />
+                    <span>Hide center frame</span>
+                  </label>
+                  <SliderRow
+                    label="Frame size"
+                    value={centerFrameSize}
+                    min={48}
+                    max={480}
+                    step={4}
+                    format={(v) => `${Math.round(v)}px`}
+                    onChange={setCenterFrameSize}
+                  />
+                  <SliderRow
+                    label="Lettra Size"
+                    value={centerFrameLabelSize}
+                    min={8}
+                    max={300}
+                    step={1}
+                    format={(v) => `${Math.round(v)}px`}
+                    onChange={setCenterFrameLabelSize}
+                  />
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    <span style={{ opacity: 0.85, fontSize: 12 }}>Flip</span>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                      <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+                        <input
+                          type="checkbox"
+                          checked={imageFlipH}
+                          onChange={(e) => setImageFlipH(e.target.checked)}
+                        />
+                        <span style={{ fontSize: 12 }}>Horizontal</span>
+                      </label>
+                      <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+                        <input
+                          type="checkbox"
+                          checked={imageFlipV}
+                          onChange={(e) => setImageFlipV(e.target.checked)}
+                        />
+                        <span style={{ fontSize: 12 }}>Vertical</span>
+                      </label>
+                    </div>
+                  </div>
+                </div>
               </div>
             )}
             {currentFile && (
@@ -1252,33 +1489,6 @@ export default function Page() {
                 <div style={{ fontWeight: 600, marginBottom: 4, opacity: 0.95 }}>
                   Adjust image
                 </div>
-                <label
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 8,
-                    cursor: "pointer",
-                    marginBottom: 8,
-                    fontSize: 12,
-                    opacity: 0.9,
-                  }}
-                >
-                  <input
-                    type="checkbox"
-                    checked={!showCenterFrame}
-                    onChange={(e) => setShowCenterFrame(!e.target.checked)}
-                  />
-                  <span>Hide center frame</span>
-                </label>
-                <SliderRow
-                  label="Frame size"
-                  value={centerFrameSize}
-                  min={48}
-                  max={480}
-                  step={4}
-                  format={(v) => `${Math.round(v)}px`}
-                  onChange={setCenterFrameSize}
-                />
                 <SliderRow
                   label="Scale"
                   value={imageScale}
@@ -1342,27 +1552,6 @@ export default function Page() {
                   format={(v) => (v === 0 ? "0" : `${v}px`)}
                   onChange={setImageBlur}
                 />
-                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                  <span style={{ opacity: 0.85, fontSize: 12 }}>Flip</span>
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
-                      <input
-                        type="checkbox"
-                        checked={imageFlipH}
-                        onChange={(e) => setImageFlipH(e.target.checked)}
-                      />
-                      <span style={{ fontSize: 12 }}>Horizontal</span>
-                    </label>
-                    <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
-                      <input
-                        type="checkbox"
-                        checked={imageFlipV}
-                        onChange={(e) => setImageFlipV(e.target.checked)}
-                      />
-                      <span style={{ fontSize: 12 }}>Vertical</span>
-                    </label>
-                  </div>
-                </div>
                 <button
                   type="button"
                   onClick={() => {
@@ -1377,6 +1566,9 @@ export default function Page() {
                     setImageBlur(0);
                     setPanX(0);
                     setPanY(0);
+                    setShowCenterFrame(DEFAULT_SETTINGS.showCenterFrame);
+                    setCenterFrameSize(DEFAULT_SETTINGS.centerFrameSize);
+                    setCenterFrameLabelSize(DEFAULT_SETTINGS.centerFrameLabelSize);
                   }}
                   style={{
                     marginTop: 8,
@@ -1495,8 +1687,8 @@ export default function Page() {
                     x={11}
                     y={9}
                     fill="#ffffff"
-                    fontSize={Math.max(7, Math.min(22, centerFrameSize * 0.12))}
-                    fontFamily='system-ui, -apple-system, sans-serif'
+                    fontSize={lettraDisplayPx}
+                    fontFamily="system-ui, -apple-system, sans-serif"
                     fontWeight={600}
                     dominantBaseline="hanging"
                   >
@@ -1547,35 +1739,76 @@ export default function Page() {
                     marginBottom: 10,
                   }}
                 >
-                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                    {[
-                      [15, "15s"],
-                      [30, "30s"],
-                      [60, "1m"],
-                      [120, "2m"],
-                      [180, "3m"],
-                      [300, "5m"],
-                      [600, "10m"],
-                      [900, "15m"],
-                      [1200, "20m"],
-                      [1800, "30m"],
-                      [3600, "1h"],
-                    ].map(([sec, label]) => (
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                    <select
+                      value={timerMode}
+                      onChange={(e) => setTimerMode(parseTimerMode(e.target.value))}
+                      aria-label="Timer mode"
+                      title={CLASSIC_MODE_TOOLTIP}
+                      style={{
+                        ...btn(false),
+                        padding: "4px 10px",
+                        fontSize: 12,
+                        appearance: "auto",
+                        WebkitAppearance: "menulist",
+                        minHeight: 28,
+                      }}
+                    >
+                      <option value="classic">Classic</option>
+                      <option value="loop">Loop</option>
+                    </select>
+                    {(timerMode === "classic"
+                      ? classicIntervalButtonLabels(classicSlots)
+                      : LOOP_INTERVAL_PRESETS.map(([sec, label]) => ({ sec, label }))
+                    ).map(({ sec, label }) => {
+                      const selected = intervalSec === sec;
+                      const classicDepleted =
+                        timerMode === "classic" &&
+                        isClassicTierSec(sec) &&
+                        classicSlots[sec] <= 0;
+                      return (
+                        <button
+                          key={sec}
+                          type="button"
+                          disabled={classicDepleted}
+                          onClick={() => {
+                            if (timerMode === "classic") {
+                              if (!isClassicTierSec(sec) || classicSlots[sec] <= 0) return;
+                            }
+                            setIntervalSec(sec);
+                          }}
+                          style={{
+                            ...btn(classicDepleted),
+                            padding: "4px 10px",
+                            fontSize: 12,
+                            opacity: classicDepleted ? 0.35 : selected ? 1 : 0.8,
+                            borderColor: selected ? "rgba(255,255,255,0.4)" : "rgba(255,255,255,0.12)",
+                          }}
+                        >
+                          {label}
+                        </button>
+                      );
+                    })}
+                    {timerMode === "classic" && (
                       <button
-                        key={sec}
                         type="button"
-                        onClick={() => setIntervalSec(sec as number)}
+                        aria-label="Reset classic mode slot counts"
+                        onClick={() => {
+                          setClassicSlots({ ...CLASSIC_SLOTS_INITIAL });
+                          setIntervalSec(CLASSIC_FIRST_TIER);
+                        }}
                         style={{
                           ...btn(false),
                           padding: "4px 10px",
                           fontSize: 12,
-                          opacity: intervalSec === sec ? 1 : 0.8,
-                          borderColor: intervalSec === sec ? "rgba(255,255,255,0.4)" : "rgba(255,255,255,0.12)",
+                          opacity: 0.9,
+                          borderColor: "rgba(255,255,255,0.2)",
                         }}
+                        title="Restore all classic tiers to their starting slot counts"
                       >
-                        {label}
+                        Reset
                       </button>
-                    ))}
+                    )}
                   </div>
                   <div
                     style={{
@@ -1587,7 +1820,13 @@ export default function Page() {
                   >
                     <button
                       type="button"
-                      onClick={() => setIsRunning((r) => !r)}
+                      onClick={() => {
+                        if (!isRunning && timerMode === "classic" && classicSlotsExhausted(classicSlots)) {
+                          setClassicSlots({ ...CLASSIC_SLOTS_INITIAL });
+                          setIntervalSec(CLASSIC_FIRST_TIER);
+                        }
+                        setIsRunning((r) => !r);
+                      }}
                       disabled={!canRun}
                       style={{
                         ...btn(!canRun),
@@ -1630,7 +1869,10 @@ export default function Page() {
                   <div
                     style={{
                       height: "100%",
-                      width: isRunning && order.length ? `${(timeRemaining / intervalSec) * 100}%` : "100%",
+                      width:
+                        isRunning && order.length
+                          ? `${(timeRemaining / Math.max(1, effectiveIntervalSec)) * 100}%`
+                          : "100%",
                       background: "rgba(255,255,255,0.6)",
                       borderRadius: 4,
                       transition: "width 1s linear",
@@ -1646,8 +1888,14 @@ export default function Page() {
                   }}
                 >
                   {isRunning && order.length
-                    ? `${timeRemaining}s left · ${intervalSec}s interval`
-                    : "Paused"}
+                    ? `${timeRemaining}s left · ${effectiveIntervalSec}s interval${
+                        timerMode === "classic" && !classicSlotsExhausted(classicSlots)
+                          ? ` · classic ${Math.min(classicCompletedCount(classicSlots) + 1, CLASSIC_STEP_TOTAL)}/${CLASSIC_STEP_TOTAL}`
+                          : ""
+                      }`
+                    : timerMode === "classic" && classicSlotsExhausted(classicSlots)
+                      ? "Classic session complete"
+                      : "Paused"}
                 </div>
               </div>
             )}
