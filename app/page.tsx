@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const APP_VERSION = "0.4.0";
 
@@ -11,7 +11,7 @@ const VERSION_HISTORY: { version: string; date: string; changes: string[] }[] = 
     changes: [
       "Layout/metadata, logo + splash/dashboard, title → home, total-elapsed reset near transport",
       "Center frame (square, crosshair, “a”, size/hide); 3m loop preset; image opacity removed",
-      "Classic: 30s×20, 1m×10, 3m×10, 5m×10, 10m×5 — pick active tier; slot-based progress",
+      "Classic: 30s×20, 1m×10, 3m×10, 5m×10, 10m×5, 15m×1 — pick active tier; slot-based progress",
     ],
   },
   {
@@ -65,6 +65,7 @@ const CLASSIC_PRESETS = [
   { sec: 180, slots: 10, shortLabel: "3m" },
   { sec: 300, slots: 10, shortLabel: "5m" },
   { sec: 600, slots: 5, shortLabel: "10m" },
+  { sec: 900, slots: 1, shortLabel: "15m" },
 ] as const;
 
 type ClassicTierSec = (typeof CLASSIC_PRESETS)[number]["sec"];
@@ -141,8 +142,16 @@ const DEFAULT_SETTINGS = {
   imageSaturation: 1,
   imageBlur: 0,
   showCenterFrame: true,
+  showGrid: true,
+  gridCellSize: 48,
   centerFrameSize: 136,
   centerFrameLabelSize: 50,
+  showOval: true,
+  ovalWidth: 139,
+  ovalHeightPx: 240,
+  ovalRotateDeg: 0,
+  ovalOffsetX: 0,
+  ovalOffsetY: 0,
   timerMode: "loop" as TimerMode,
 };
 
@@ -152,7 +161,14 @@ function loadStoredSettings(): typeof DEFAULT_SETTINGS {
     const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
     if (!raw) return DEFAULT_SETTINGS;
     const parsed = JSON.parse(raw) as Partial<typeof DEFAULT_SETTINGS>;
-    return { ...DEFAULT_SETTINGS, ...parsed };
+    const merged = { ...DEFAULT_SETTINGS, ...parsed };
+    if (parsed.ovalHeightPx === undefined && parsed.ovalWidth != null) {
+      const ow = Number(parsed.ovalWidth);
+      if (Number.isFinite(ow)) {
+        merged.ovalHeightPx = Math.max(48, Math.round(ow * 0.58));
+      }
+    }
+    return merged;
   } catch {
     return DEFAULT_SETTINGS;
   }
@@ -344,6 +360,121 @@ function SliderRow({
   );
 }
 
+function normalizeDeg(deg: number): number {
+  let d = deg % 360;
+  if (d > 180) d -= 360;
+  if (d < -180) d += 360;
+  return d;
+}
+
+/** Hit-test point (viewport) against ellipse centered at (cx,cy) with rotation rotDeg (deg). */
+function pointInRotatedEllipse(
+  clientX: number,
+  clientY: number,
+  cx: number,
+  cy: number,
+  rotDeg: number,
+  rx: number,
+  ry: number
+): boolean {
+  const dx = clientX - cx;
+  const dy = clientY - cy;
+  const rad = (rotDeg * Math.PI) / 180;
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
+  const xLocal = dx * cos + dy * sin;
+  const yLocal = -dx * sin + dy * cos;
+  return (xLocal * xLocal) / (rx * rx) + (yLocal * yLocal) / (ry * ry) <= 1;
+}
+
+function clientPointToSvgUser(
+  svg: SVGSVGElement,
+  clientX: number,
+  clientY: number
+): { x: number; y: number } | null {
+  const pt = svg.createSVGPoint();
+  pt.x = clientX;
+  pt.y = clientY;
+  const ctm = svg.getScreenCTM();
+  if (!ctm) return null;
+  const p = pt.matrixTransform(ctm.inverse());
+  return { x: p.x, y: p.y };
+}
+
+/** Curved-arrow cursor for oval rotation (compact; hot spot center). */
+const OVAL_ROTATE_CURSOR = `url("data:image/svg+xml;charset=utf-8,${encodeURIComponent(
+  `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20">
+    <path d="M10 4.5 A6.2 6.2 0 1 1 6.5 13.5" fill="none" stroke="white" stroke-width="3" stroke-linecap="round"/>
+    <path d="M10 4.5 A6.2 6.2 0 1 1 6.5 13.5" fill="none" stroke="black" stroke-width="1.1" stroke-linecap="round"/>
+    <path d="M10 2.2 L13.2 7.8 H6.8 Z" fill="white" stroke="black" stroke-width="0.65" stroke-linejoin="round"/>
+  </svg>`
+)}") 10 10, crosshair`;
+
+function resolveOvalSvgPointerCursor(
+  svg: SVGSVGElement,
+  clientX: number,
+  clientY: number,
+  altKey: boolean,
+  shiftKey: boolean,
+  ovalWidth: number,
+  ovalHeightPx: number,
+  ovalRotateDeg: number
+): string {
+  const lp = clientPointToSvgUser(svg, clientX, clientY);
+  if (!lp) return "grab";
+
+  const lcx = ovalWidth / 2;
+  const lcy = ovalHeightPx / 2;
+  const lerx = Math.max(4, ovalWidth / 2 - 4);
+  const lery = Math.max(4, ovalHeightPx / 2 - 4);
+  const boxL = lcx - lerx;
+  const boxT = lcy - lery;
+  const boxWi = 2 * lerx;
+  const boxHi = 2 * lery;
+  const cornerSz = Math.min(14, Math.max(5, Math.min(ovalWidth, ovalHeightPx) * 0.06));
+  const cornerHalf = cornerSz / 2;
+  const cornerPts = [
+    [boxL, boxT],
+    [boxL + boxWi, boxT],
+    [boxL + boxWi, boxT + boxHi],
+    [boxL, boxT + boxHi],
+  ] as const;
+  const cornerCursors = ["nwse-resize", "nesw-resize", "nwse-resize", "nesw-resize"] as const;
+  for (let i = 0; i < 4; i++) {
+    const [bx, by] = cornerPts[i];
+    if (
+      lp.x >= bx - cornerHalf &&
+      lp.x <= bx + cornerHalf &&
+      lp.y >= by - cornerHalf &&
+      lp.y <= by + cornerHalf
+    ) {
+      return cornerCursors[i];
+    }
+  }
+
+  const srect = svg.getBoundingClientRect();
+  const scx = srect.left + srect.width / 2;
+  const scy = srect.top + srect.height / 2;
+  const scaleX = srect.width / ovalWidth;
+  const scaleY = srect.height / ovalHeightPx;
+  const rxPix = Math.max(4, ovalWidth / 2 - 4) * scaleX;
+  const ryPix = Math.max(4, ovalHeightPx / 2 - 4) * scaleY;
+  const inEllipse = pointInRotatedEllipse(
+    clientX,
+    clientY,
+    scx,
+    scy,
+    ovalRotateDeg,
+    rxPix,
+    ryPix
+  );
+
+  if (!inEllipse) return "grab";
+  if (shiftKey) return "ns-resize";
+  if (altKey) return OVAL_ROTATE_CURSOR;
+  return "grab";
+}
+
 export default function Page() {
   const [dirHandle, setDirHandle] = useState<FileSystemDirectoryHandle | null>(null);
   const [files, setFiles] = useState<FileHandleEntry[]>([]);
@@ -373,6 +504,10 @@ export default function Page() {
   const imageContainerRef = useRef<HTMLDivElement | null>(null);
   const fullscreenContainerRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const ovalHitAreaRef = useRef<HTMLDivElement | null>(null);
+  const ovalSvgRef = useRef<SVGSVGElement | null>(null);
+  const lastPointerOnOvalSvgRef = useRef<{ x: number; y: number } | null>(null);
+  const pointerInsideOvalSvgRef = useRef(false);
 
   const [supported, setSupported] = useState(false);
   const [lastFolderName, setLastFolderNameState] = useState("");
@@ -398,6 +533,10 @@ export default function Page() {
   const [showCenterFrame, setShowCenterFrame] = useState(
     storedSettings.showCenterFrame !== false
   );
+  const [showGrid, setShowGrid] = useState(storedSettings.showGrid !== false);
+  const [gridCellSize, setGridCellSize] = useState(
+    Math.min(200, Math.max(16, Number(storedSettings.gridCellSize) || 48))
+  );
   const [centerFrameSize, setCenterFrameSize] = useState(
     Math.min(
       480,
@@ -410,6 +549,52 @@ export default function Page() {
       Math.max(8, Number(storedSettings.centerFrameLabelSize) || 50)
     )
   );
+  const [showOval, setShowOval] = useState(storedSettings.showOval !== false);
+  const [ovalWidth, setOvalWidth] = useState(
+    Math.min(560, Math.max(80, Number(storedSettings.ovalWidth) || 139))
+  );
+  const [ovalHeightPx, setOvalHeightPx] = useState(() => {
+    const w = Number(storedSettings.ovalWidth) || 139;
+    const fromStored = Number(storedSettings.ovalHeightPx);
+    const fallback = Math.max(80, Math.round(w / 0.58));
+    return Math.min(
+      560,
+      Math.max(48, Number.isFinite(fromStored) ? fromStored : fallback)
+    );
+  });
+  const [ovalRotateDeg, setOvalRotateDeg] = useState(
+    Math.min(180, Math.max(-180, Number(storedSettings.ovalRotateDeg) || 0))
+  );
+  const [ovalOffsetX, setOvalOffsetX] = useState(
+    Number.isFinite(Number(storedSettings.ovalOffsetX)) ? Number(storedSettings.ovalOffsetX) : 0
+  );
+  const [ovalOffsetY, setOvalOffsetY] = useState(
+    Number.isFinite(Number(storedSettings.ovalOffsetY)) ? Number(storedSettings.ovalOffsetY) : 0
+  );
+  /** Selected after clicking the oval; yellow outline. Cleared by clicking outside the oval. */
+  const [ovalSelected, setOvalSelected] = useState(false);
+  const ovalSelectedRef = useRef(ovalSelected);
+  ovalSelectedRef.current = ovalSelected;
+  const ovalRotateDegRef = useRef(ovalRotateDeg);
+  ovalRotateDegRef.current = ovalRotateDeg;
+  const ovalCrosshairHalf = useMemo(
+    () => Math.max(10, Math.min(ovalWidth, ovalHeightPx) * 0.11),
+    [ovalWidth, ovalHeightPx]
+  );
+  const ovalStrokeColor = ovalSelected ? "#facc15" : "#ffffff";
+  const ovalCx = ovalWidth / 2;
+  const ovalCy = ovalHeightPx / 2;
+  const ovalErx = Math.max(4, ovalWidth / 2 - 4);
+  const ovalEry = Math.max(4, ovalHeightPx / 2 - 4);
+  const ovalBoxLeft = ovalCx - ovalErx;
+  const ovalBoxTop = ovalCy - ovalEry;
+  const ovalBoxW = 2 * ovalErx;
+  const ovalBoxH = 2 * ovalEry;
+  const ovalBoundingCornerSize = useMemo(
+    () => Math.min(14, Math.max(5, Math.min(ovalWidth, ovalHeightPx) * 0.06)),
+    [ovalWidth, ovalHeightPx]
+  );
+  const ovalBoundingCornerHalf = ovalBoundingCornerSize / 2;
   const lettraDisplayPx = useMemo(
     () =>
       Math.max(
@@ -419,6 +604,367 @@ export default function Page() {
     [centerFrameLabelSize, centerFrameSize]
   );
 
+  const handleOvalPointerDown = useCallback(
+    (e: React.PointerEvent<SVGSVGElement>) => {
+      const svg = e.currentTarget;
+      const srect = svg.getBoundingClientRect();
+      const scx = srect.left + srect.width / 2;
+      const scy = srect.top + srect.height / 2;
+      const scaleX = srect.width / ovalWidth;
+      const scaleY = srect.height / ovalHeightPx;
+      const rxGeom = Math.max(4, ovalWidth / 2 - 4);
+      const ryGeom = Math.max(4, ovalHeightPx / 2 - 4);
+      const rxPix = rxGeom * scaleX;
+      const ryPix = ryGeom * scaleY;
+
+      const lp = clientPointToSvgUser(svg, e.clientX, e.clientY);
+      if (!lp) return;
+
+      const lcx = ovalWidth / 2;
+      const lcy = ovalHeightPx / 2;
+      const lerx = Math.max(4, ovalWidth / 2 - 4);
+      const lery = Math.max(4, ovalHeightPx / 2 - 4);
+      const boxL = lcx - lerx;
+      const boxT = lcy - lery;
+      const boxWi = 2 * lerx;
+      const boxHi = 2 * lery;
+      const cornerSz = Math.min(14, Math.max(5, Math.min(ovalWidth, ovalHeightPx) * 0.06));
+      const cornerHalf = cornerSz / 2;
+
+      const cornerPts = [
+        [boxL, boxT],
+        [boxL + boxWi, boxT],
+        [boxL + boxWi, boxT + boxHi],
+        [boxL, boxT + boxHi],
+      ] as const;
+
+      let cornerIndex: number | null = null;
+      for (let i = 0; i < 4; i++) {
+        const [bx, by] = cornerPts[i];
+        if (
+          lp.x >= bx - cornerHalf &&
+          lp.x <= bx + cornerHalf &&
+          lp.y >= by - cornerHalf &&
+          lp.y <= by + cornerHalf
+        ) {
+          cornerIndex = i;
+          break;
+        }
+      }
+
+      const inEllipse = pointInRotatedEllipse(
+        e.clientX,
+        e.clientY,
+        scx,
+        scy,
+        ovalRotateDeg,
+        rxPix,
+        ryPix
+      );
+
+      if (cornerIndex === null && !inEllipse) return;
+
+      e.preventDefault();
+      e.stopPropagation();
+      const pointerId = e.pointerId;
+      svg.setPointerCapture(pointerId);
+      setOvalSelected(true);
+
+      const bindGesture = (onMove: (ev: PointerEvent) => void, cursor: string) => {
+        svg.style.cursor = cursor;
+        const wrappedUp = () => {
+          svg.style.cursor = "grab";
+          try {
+            if (svg.hasPointerCapture(pointerId)) svg.releasePointerCapture(pointerId);
+          } catch {
+            /* ignore */
+          }
+          window.removeEventListener("pointermove", onMove);
+          window.removeEventListener("pointerup", wrappedUp);
+          window.removeEventListener("pointercancel", wrappedUp);
+        };
+        window.addEventListener("pointermove", onMove);
+        window.addEventListener("pointerup", wrappedUp);
+        window.addEventListener("pointercancel", wrappedUp);
+      };
+
+      if (e.shiftKey && inEllipse) {
+        const r0 = Math.max(10, Math.hypot(e.clientX - scx, e.clientY - scy));
+        const startW = ovalWidth;
+        bindGesture((ev: PointerEvent) => {
+          const r = Math.max(10, Math.hypot(ev.clientX - scx, ev.clientY - scy));
+          const w = Math.min(560, Math.max(80, Math.round(((startW * r) / r0) / 4) * 4));
+          setOvalWidth(w);
+        }, "ns-resize");
+        return;
+      }
+
+      if (cornerIndex !== null) {
+        const startW = ovalWidth;
+        const startH = ovalHeightPx;
+        const startClientX = e.clientX;
+        const startClientY = e.clientY;
+        const mults = [
+          [-2, -2],
+          [2, -2],
+          [2, 2],
+          [-2, 2],
+        ] as const;
+        const [mx, my] = mults[cornerIndex];
+        const cursors = ["nwse-resize", "nesw-resize", "nwse-resize", "nesw-resize"] as const;
+        bindGesture((ev: PointerEvent) => {
+          const dx = ev.clientX - startClientX;
+          const dy = ev.clientY - startClientY;
+          const w = Math.min(560, Math.max(80, Math.round((startW + mx * dx) / 4) * 4));
+          const h = Math.min(560, Math.max(48, Math.round(startH + my * dy)));
+          setOvalWidth(w);
+          setOvalHeightPx(h);
+        }, cursors[cornerIndex]);
+        return;
+      }
+
+      if (e.altKey && inEllipse) {
+        const θ0 = Math.atan2(e.clientY - scy, e.clientX - scx);
+        const angleOffset = θ0 - (ovalRotateDeg * Math.PI) / 180;
+        bindGesture((ev: PointerEvent) => {
+          const θ = Math.atan2(ev.clientY - scy, ev.clientX - scx);
+          setOvalRotateDeg(normalizeDeg(((θ - angleOffset) * 180) / Math.PI));
+        }, "grabbing");
+        return;
+      }
+
+      const startX = e.clientX;
+      const startY = e.clientY;
+      const startOx = ovalOffsetX;
+      const startOy = ovalOffsetY;
+      bindGesture((ev: PointerEvent) => {
+        setOvalOffsetX(startOx + ev.clientX - startX);
+        setOvalOffsetY(startOy + ev.clientY - startY);
+      }, "move");
+    },
+    [ovalWidth, ovalHeightPx, ovalRotateDeg, ovalOffsetX, ovalOffsetY]
+  );
+
+  const handleOvalSvgPointerMove = useCallback(
+    (e: React.PointerEvent<SVGSVGElement>) => {
+      lastPointerOnOvalSvgRef.current = { x: e.clientX, y: e.clientY };
+      e.currentTarget.style.cursor = resolveOvalSvgPointerCursor(
+        e.currentTarget,
+        e.clientX,
+        e.clientY,
+        e.altKey,
+        e.shiftKey,
+        ovalWidth,
+        ovalHeightPx,
+        ovalRotateDeg
+      );
+    },
+    [ovalWidth, ovalHeightPx, ovalRotateDeg]
+  );
+
+  const handleOvalSvgPointerEnter = useCallback(
+    (e: React.PointerEvent<SVGSVGElement>) => {
+      pointerInsideOvalSvgRef.current = true;
+      lastPointerOnOvalSvgRef.current = { x: e.clientX, y: e.clientY };
+      e.currentTarget.style.cursor = resolveOvalSvgPointerCursor(
+        e.currentTarget,
+        e.clientX,
+        e.clientY,
+        e.altKey,
+        e.shiftKey,
+        ovalWidth,
+        ovalHeightPx,
+        ovalRotateDeg
+      );
+    },
+    [ovalWidth, ovalHeightPx, ovalRotateDeg]
+  );
+
+  const handleOvalSvgPointerLeave = useCallback(() => {
+    pointerInsideOvalSvgRef.current = false;
+    lastPointerOnOvalSvgRef.current = null;
+    const svg = ovalSvgRef.current;
+    if (svg) svg.style.cursor = "grab";
+  }, []);
+
+  useEffect(() => {
+    if (!currentUrl || !showOval) return;
+    const syncAltCursor = (e: KeyboardEvent) => {
+      if (e.key !== "Alt") return;
+      if (!pointerInsideOvalSvgRef.current) return;
+      const svg = ovalSvgRef.current;
+      const pt = lastPointerOnOvalSvgRef.current;
+      if (!svg || !pt) return;
+      const altHeld = e.type === "keydown";
+      svg.style.cursor = resolveOvalSvgPointerCursor(
+        svg,
+        pt.x,
+        pt.y,
+        altHeld,
+        e.shiftKey,
+        ovalWidth,
+        ovalHeightPx,
+        ovalRotateDeg
+      );
+    };
+    window.addEventListener("keydown", syncAltCursor);
+    window.addEventListener("keyup", syncAltCursor);
+    return () => {
+      window.removeEventListener("keydown", syncAltCursor);
+      window.removeEventListener("keyup", syncAltCursor);
+    };
+  }, [currentUrl, showOval, ovalWidth, ovalHeightPx, ovalRotateDeg]);
+
+  useEffect(() => {
+    if (!currentUrl || !showOval) {
+      setOvalSelected(false);
+    }
+  }, [currentUrl, showOval]);
+
+  useEffect(() => {
+    if (!currentUrl || !showOval) return;
+    const ROTATE_DRAG_PX = 6;
+    const onDocPointerDown = (ev: PointerEvent) => {
+      const hit = ovalHitAreaRef.current;
+      if (hit && ev.target instanceof Node && hit.contains(ev.target)) return;
+
+      if (!ovalSelectedRef.current) return;
+
+      const stage = slideshowStageRef.current;
+      const t = ev.target;
+      if (!(t instanceof Node) || !stage?.contains(t)) {
+        ovalSelectedRef.current = false;
+        setOvalSelected(false);
+        return;
+      }
+
+      if (t instanceof Element) {
+        if (t.closest("button, input, select, textarea, label, a, option")) {
+          ovalSelectedRef.current = false;
+          setOvalSelected(false);
+          return;
+        }
+      }
+
+      if (ev.button !== 0) return;
+
+      ev.preventDefault();
+      ev.stopPropagation();
+
+      const svg = ovalSvgRef.current;
+      if (!svg) {
+        ovalSelectedRef.current = false;
+        setOvalSelected(false);
+        return;
+      }
+
+      const srect = svg.getBoundingClientRect();
+      const scx = srect.left + srect.width / 2;
+      const scy = srect.top + srect.height / 2;
+      const θ0 = Math.atan2(ev.clientY - scy, ev.clientX - scx);
+      const angleOffset = θ0 - (ovalRotateDegRef.current * Math.PI) / 180;
+      const pointerId = ev.pointerId;
+      const captureEl = t instanceof Element ? t : stage;
+      const startX = ev.clientX;
+      const startY = ev.clientY;
+      let rotationActive = false;
+
+      try {
+        captureEl.setPointerCapture(pointerId);
+      } catch {
+        /* ignore */
+      }
+
+      const onMove = (moveEv: PointerEvent) => {
+        const dist = Math.hypot(moveEv.clientX - startX, moveEv.clientY - startY);
+        if (!rotationActive) {
+          if (dist < ROTATE_DRAG_PX) return;
+          rotationActive = true;
+        }
+        const θ = Math.atan2(moveEv.clientY - scy, moveEv.clientX - scx);
+        setOvalRotateDeg(normalizeDeg(((θ - angleOffset) * 180) / Math.PI));
+      };
+      const onUp = () => {
+        try {
+          if (captureEl.hasPointerCapture(pointerId)) captureEl.releasePointerCapture(pointerId);
+        } catch {
+          /* ignore */
+        }
+        document.removeEventListener("pointermove", onMove);
+        document.removeEventListener("pointerup", onUp);
+        document.removeEventListener("pointercancel", onUp);
+        if (!rotationActive) {
+          ovalSelectedRef.current = false;
+          setOvalSelected(false);
+        }
+      };
+      document.addEventListener("pointermove", onMove);
+      document.addEventListener("pointerup", onUp);
+      document.addEventListener("pointercancel", onUp);
+    };
+    document.addEventListener("pointerdown", onDocPointerDown, true);
+    return () => document.removeEventListener("pointerdown", onDocPointerDown, true);
+  }, [currentUrl, showOval]);
+
+  useEffect(() => {
+    if (!showOval || !currentUrl) setDeckCursorMode("grab");
+  }, [showOval, currentUrl]);
+
+  useEffect(() => {
+    if (!ovalSelected) setDeckCursorMode("grab");
+  }, [ovalSelected]);
+
+  useEffect(() => {
+    const el = zoomContainerRef.current;
+    if (!el) return;
+    const onMove = (e: PointerEvent) => {
+      if (!currentUrl || !showOval || !ovalSelectedRef.current) {
+        setDeckCursorMode((m) => (m === "grab" ? m : "grab"));
+        return;
+      }
+      const hit = ovalHitAreaRef.current;
+      if (!hit) return;
+      const r = hit.getBoundingClientRect();
+      const outside =
+        e.clientX < r.left ||
+        e.clientX > r.right ||
+        e.clientY < r.top ||
+        e.clientY > r.bottom;
+      const next = outside ? "rotate" : "grab";
+      setDeckCursorMode((m) => (m === next ? m : next));
+    };
+    const onLeave = () => setDeckCursorMode("grab");
+    el.addEventListener("pointermove", onMove);
+    el.addEventListener("pointerleave", onLeave);
+    return () => {
+      el.removeEventListener("pointermove", onMove);
+      el.removeEventListener("pointerleave", onLeave);
+    };
+  }, [currentUrl, showOval, ovalSelected]);
+
+  useEffect(() => {
+    const el = ovalSvgRef.current;
+    if (!el || !currentUrl || !showOval) return;
+    const onWheel = (ev: WheelEvent) => {
+      const srect = el.getBoundingClientRect();
+      const scx = srect.left + srect.width / 2;
+      const scy = srect.top + srect.height / 2;
+      const scaleX = srect.width / ovalWidth;
+      const scaleY = srect.height / ovalHeightPx;
+      const rxPix = Math.max(4, ovalWidth / 2 - 4) * scaleX;
+      const ryPix = Math.max(4, ovalHeightPx / 2 - 4) * scaleY;
+      if (!pointInRotatedEllipse(ev.clientX, ev.clientY, scx, scy, ovalRotateDeg, rxPix, ryPix)) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      setOvalSelected(true);
+      const dir = ev.deltaY > 0 ? -1 : 1;
+      const step = ev.shiftKey ? 16 : 8;
+      setOvalWidth((w) => Math.min(560, Math.max(80, Math.round((w + dir * step) / 4) * 4)));
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [currentUrl, showOval, ovalWidth, ovalHeightPx, ovalRotateDeg]);
+
   const effectiveIntervalSec = useMemo(() => {
     if (timerMode !== "classic") return intervalSec;
     if (classicSlotsExhausted(classicSlots)) return CLASSIC_EXHAUSTED_PLACEHOLDER_SEC;
@@ -427,9 +973,16 @@ export default function Page() {
   }, [timerMode, intervalSec, classicSlots]);
   const [panX, setPanX] = useState(0);
   const [panY, setPanY] = useState(0);
+  /** Same transform as the image so the oval’s top/bottom follow the picture (rotate, flip, pan, zoom). */
+  const imageComposeTransform = useMemo(
+    () =>
+      `translate(${panX}px, ${panY}px) scale(${imageScale}) rotate(${imageRotate}deg) scaleX(${imageFlipH ? -1 : 1}) scaleY(${imageFlipV ? -1 : 1})`,
+    [panX, panY, imageScale, imageRotate, imageFlipH, imageFlipV]
+  );
   const [isPanning, setIsPanning] = useState(false);
+  /** When oval is selected, show rotate cursor over the image outside the oval widget. */
+  const [deckCursorMode, setDeckCursorMode] = useState<"grab" | "rotate">("grab");
   const panStartRef = useRef<{ startX: number; startY: number; startPanX: number; startPanY: number } | null>(null);
-  const hasPannedRef = useRef(false);
   const pinchRef = useRef<{
     distance: number;
     scale: number;
@@ -437,6 +990,8 @@ export default function Page() {
     lastTime?: number;
   } | null>(null);
   const zoomContainerRef = useRef<HTMLDivElement | null>(null);
+  /** Image stage (excludes side panels); hit target for oval deselect / rotate-from-image. */
+  const slideshowStageRef = useRef<HTMLDivElement | null>(null);
   const imageScaleRef = useRef(imageScale);
   imageScaleRef.current = imageScale;
   const prevIdxInOrderRef = useRef<number | null>(null);
@@ -511,12 +1066,25 @@ export default function Page() {
     setImageSaturation(s.imageSaturation);
     setImageBlur(s.imageBlur);
     setShowCenterFrame(s.showCenterFrame !== false);
+    setShowGrid(s.showGrid !== false);
+    setGridCellSize(Math.min(200, Math.max(16, Number(s.gridCellSize) || 48)));
     setCenterFrameSize(
       Math.min(480, Math.max(48, Number(s.centerFrameSize) || 136))
     );
     setCenterFrameLabelSize(
       Math.min(300, Math.max(8, Number(s.centerFrameLabelSize) || 50))
     );
+    setShowOval(s.showOval !== false);
+    const ow = Math.min(560, Math.max(80, Number(s.ovalWidth) || 139));
+    setOvalWidth(ow);
+    const fromStoredH = Number(s.ovalHeightPx);
+    const hFallback = Math.max(80, Math.round(ow / 0.58));
+    setOvalHeightPx(
+      Math.min(560, Math.max(48, Number.isFinite(fromStoredH) ? fromStoredH : hFallback))
+    );
+    setOvalRotateDeg(Math.min(180, Math.max(-180, Number(s.ovalRotateDeg) || 0)));
+    setOvalOffsetX(Number.isFinite(Number(s.ovalOffsetX)) ? Number(s.ovalOffsetX) : 0);
+    setOvalOffsetY(Number.isFinite(Number(s.ovalOffsetY)) ? Number(s.ovalOffsetY) : 0);
     setTimerMode(parseTimerMode(s.timerMode));
   }, []);
 
@@ -535,8 +1103,16 @@ export default function Page() {
       imageSaturation,
       imageBlur,
       showCenterFrame,
+      showGrid,
+      gridCellSize,
       centerFrameSize,
       centerFrameLabelSize,
+      showOval,
+      ovalWidth,
+      ovalHeightPx,
+      ovalRotateDeg,
+      ovalOffsetX,
+      ovalOffsetY,
       timerMode,
     });
   }, [
@@ -552,8 +1128,16 @@ export default function Page() {
     imageSaturation,
     imageBlur,
     showCenterFrame,
+    showGrid,
+    gridCellSize,
     centerFrameSize,
     centerFrameLabelSize,
+    showOval,
+    ovalWidth,
+    ovalHeightPx,
+    ovalRotateDeg,
+    ovalOffsetX,
+    ovalOffsetY,
     timerMode,
   ]);
 
@@ -605,7 +1189,7 @@ export default function Page() {
     setOrder(shuffle(collected.map((_, i) => i)));
     setIdxInOrder(0);
     setClassicSlots({ ...CLASSIC_SLOTS_INITIAL });
-    setIsRunning(true);
+    setIsRunning(false);
   }
 
   async function pickFolder() {
@@ -881,7 +1465,6 @@ export default function Page() {
     if (!isPanning) return;
     function handleMouseMove(e: MouseEvent) {
       if (panStartRef.current) {
-        hasPannedRef.current = true;
         setPanX(panStartRef.current.startPanX + (e.clientX - panStartRef.current.startX));
         setPanY(panStartRef.current.startPanY + (e.clientY - panStartRef.current.startY));
       }
@@ -1104,7 +1687,7 @@ export default function Page() {
             lineHeight: 1.5,
             animation: "landingFadeIn 0.5s ease-out 0.08s both",
           }}>
-            Pick a folder → images shuffle → auto-advance
+            Pick a folder → images shuffle → press play to auto-advance
           </p>
 
           {!supported && (
@@ -1285,23 +1868,6 @@ export default function Page() {
               {dirHandle ? "Change Folder" : "Pick Folder"}
             </button>
 
-            <button
-              onClick={() => {
-                if (timerMode === "classic" && classicSlotsExhausted(classicSlots)) {
-                  setClassicSlots({ ...CLASSIC_SLOTS_INITIAL });
-                  setIntervalSec(CLASSIC_FIRST_TIER);
-                }
-                setIsRunning(true);
-              }}
-              disabled={!canRun}
-              style={btn(!canRun)}
-            >
-              Start
-            </button>
-            <button onClick={() => setIsRunning(false)} disabled={!canRun} style={btn(!canRun)}>
-              Pause
-            </button>
-
             <button onClick={prev} disabled={!canRun} style={btn(!canRun)}>
               ←
             </button>
@@ -1405,23 +1971,75 @@ export default function Page() {
                   }}
                 >
                   <div style={{ fontWeight: 600, opacity: 0.95, fontSize: 12 }}>Center frame & flip</div>
-                  <label
+                  <div
                     style={{
                       display: "flex",
+                      flexWrap: "wrap",
+                      gap: "12px 20px",
                       alignItems: "center",
-                      gap: 8,
-                      cursor: "pointer",
-                      fontSize: 12,
-                      opacity: 0.9,
                     }}
                   >
-                    <input
-                      type="checkbox"
-                      checked={!showCenterFrame}
-                      onChange={(e) => setShowCenterFrame(!e.target.checked)}
-                    />
-                    <span>Hide center frame</span>
-                  </label>
+                    <label
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        cursor: "pointer",
+                        fontSize: 12,
+                        opacity: 0.9,
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={!showCenterFrame}
+                        onChange={(e) => setShowCenterFrame(!e.target.checked)}
+                      />
+                      <span>Hide center frame</span>
+                    </label>
+                    <label
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        cursor: "pointer",
+                        fontSize: 12,
+                        opacity: 0.9,
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={!showGrid}
+                        onChange={(e) => setShowGrid(!e.target.checked)}
+                      />
+                      <span>Hide grid</span>
+                    </label>
+                    <label
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        cursor: "pointer",
+                        fontSize: 12,
+                        opacity: 0.9,
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={!showOval}
+                        onChange={(e) => setShowOval(!e.target.checked)}
+                      />
+                      <span>Hide oval</span>
+                    </label>
+                  </div>
+                  <SliderRow
+                    label="Grid cell size"
+                    value={gridCellSize}
+                    min={16}
+                    max={200}
+                    step={4}
+                    format={(v) => `${Math.round(v)}px`}
+                    onChange={setGridCellSize}
+                  />
                   <SliderRow
                     label="Frame size"
                     value={centerFrameSize}
@@ -1440,6 +2058,62 @@ export default function Page() {
                     format={(v) => `${Math.round(v)}px`}
                     onChange={setCenterFrameLabelSize}
                   />
+                  <SliderRow
+                    label="Oval width"
+                    value={ovalWidth}
+                    min={80}
+                    max={560}
+                    step={4}
+                    format={(v) => `${Math.round(v)}×${ovalHeightPx} px`}
+                    onChange={setOvalWidth}
+                  />
+                  <SliderRow
+                    label="Oval height"
+                    value={ovalHeightPx}
+                    min={48}
+                    max={560}
+                    step={4}
+                    format={(v) => `${Math.round(v)}px`}
+                    onChange={setOvalHeightPx}
+                  />
+                  <SliderRow
+                    label="Oval rotation"
+                    value={ovalRotateDeg}
+                    min={-180}
+                    max={180}
+                    step={1}
+                    format={(v) => `${Math.round(v)}°`}
+                    onChange={setOvalRotateDeg}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOvalWidth(DEFAULT_SETTINGS.ovalWidth);
+                      setOvalHeightPx(DEFAULT_SETTINGS.ovalHeightPx);
+                      setOvalRotateDeg(DEFAULT_SETTINGS.ovalRotateDeg);
+                      setOvalOffsetX(DEFAULT_SETTINGS.ovalOffsetX);
+                      setOvalOffsetY(DEFAULT_SETTINGS.ovalOffsetY);
+                      setOvalSelected(false);
+                    }}
+                    style={{
+                      alignSelf: "flex-start",
+                      padding: "6px 10px",
+                      fontSize: 12,
+                      borderRadius: 6,
+                      border: "1px solid rgba(255,255,255,0.2)",
+                      background: "rgba(255,255,255,0.08)",
+                      color: "white",
+                      cursor: "pointer",
+                    }}
+                  >
+                    Reset oval
+                  </button>
+                  <p style={{ margin: 0, fontSize: 11, opacity: 0.65, lineHeight: 1.4 }}>
+                    Drag inside the oval to move it (turns yellow when selected). With the oval selected,
+                    drag on the image outside the oval to rotate (cursor shows a curved arrow); a short click
+                    there without dragging deselects. Alt+drag on the oval also rotates. Shift+drag or scroll
+                    on the oval resizes width from the center. Drag the white corner squares to resize.
+                  </p>
                   <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                     <span style={{ opacity: 0.85, fontSize: 12 }}>Flip</span>
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
@@ -1567,8 +2241,16 @@ export default function Page() {
                     setPanX(0);
                     setPanY(0);
                     setShowCenterFrame(DEFAULT_SETTINGS.showCenterFrame);
+                    setShowGrid(DEFAULT_SETTINGS.showGrid);
+                    setGridCellSize(DEFAULT_SETTINGS.gridCellSize);
                     setCenterFrameSize(DEFAULT_SETTINGS.centerFrameSize);
                     setCenterFrameLabelSize(DEFAULT_SETTINGS.centerFrameLabelSize);
+                    setShowOval(DEFAULT_SETTINGS.showOval);
+                    setOvalWidth(DEFAULT_SETTINGS.ovalWidth);
+                    setOvalHeightPx(DEFAULT_SETTINGS.ovalHeightPx);
+                    setOvalRotateDeg(DEFAULT_SETTINGS.ovalRotateDeg);
+                    setOvalOffsetX(DEFAULT_SETTINGS.ovalOffsetX);
+                    setOvalOffsetY(DEFAULT_SETTINGS.ovalOffsetY);
                   }}
                   style={{
                     marginTop: 8,
@@ -1586,6 +2268,7 @@ export default function Page() {
               </div>
             )}
             <div
+              ref={slideshowStageRef}
               style={{
                 flex: 1,
                 display: "flex",
@@ -1606,14 +2289,19 @@ export default function Page() {
                   display: "flex",
                   alignItems: "center",
                   justifyContent: "center",
-                  transform: `translate(${panX}px, ${panY}px) scale(${imageScale}) rotate(${imageRotate}deg) scaleX(${imageFlipH ? -1 : 1}) scaleY(${imageFlipV ? -1 : 1})`,
-                  cursor: isPanning ? "grabbing" : imageScale > 1 ? "grab" : "pointer",
+                  transform: imageComposeTransform,
+                  transformOrigin: "center center",
+                  cursor: isPanning
+                    ? "grabbing"
+                    : deckCursorMode === "rotate"
+                      ? OVAL_ROTATE_CURSOR
+                      : "grab",
                   userSelect: "none",
                   touchAction: "none",
                 }}
                 onMouseDown={(e) => {
                   if (e.button !== 0) return;
-                  hasPannedRef.current = false;
+                  if (showOval && ovalSelectedRef.current) return;
                   setIsPanning(true);
                   panStartRef.current = {
                     startX: e.clientX,
@@ -1626,13 +2314,6 @@ export default function Page() {
                 <img
                   src={currentUrl}
                   alt={currentFile?.name || "gesture"}
-                  onClick={() => {
-                    if (hasPannedRef.current) {
-                      hasPannedRef.current = false;
-                      return;
-                    }
-                    toggleFullscreen();
-                  }}
                   draggable={false}
                   onLoad={(e) => {
                     const img = e.currentTarget;
@@ -1655,6 +2336,23 @@ export default function Page() {
                 />
               </div>
             </div>
+            {currentUrl && showGrid && (
+              <div
+                aria-hidden
+                style={{
+                  position: "absolute",
+                  inset: 0,
+                  pointerEvents: "none",
+                  zIndex: 2,
+                  backgroundImage: `
+                    linear-gradient(to right, rgba(255,255,255,0.48) 2px, transparent 2px),
+                    linear-gradient(to bottom, rgba(255,255,255,0.48) 2px, transparent 2px)
+                  `,
+                  backgroundSize: `${gridCellSize}px ${gridCellSize}px`,
+                  backgroundPosition: "center center",
+                }}
+              />
+            )}
             {currentUrl && showCenterFrame && (
               <div
                 aria-hidden
@@ -1714,6 +2412,116 @@ export default function Page() {
                     strokeLinecap="square"
                   />
                 </svg>
+              </div>
+            )}
+            {currentUrl && showOval && (
+              <div
+                style={{
+                  position: "absolute",
+                  inset: 0,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  pointerEvents: "none",
+                  zIndex: 4,
+                  transform: imageComposeTransform,
+                  transformOrigin: "center center",
+                }}
+              >
+                <div
+                  ref={ovalHitAreaRef}
+                  style={{
+                    transform: `translate(${ovalOffsetX}px, ${ovalOffsetY}px)`,
+                    flexShrink: 0,
+                    pointerEvents: "auto",
+                    touchAction: "none",
+                  }}
+                >
+                  <div
+                    style={{
+                      transform: `rotate(${ovalRotateDeg}deg)`,
+                      transformOrigin: "center center",
+                    }}
+                  >
+                    <svg
+                      ref={ovalSvgRef}
+                      width={ovalWidth}
+                      height={ovalHeightPx}
+                      viewBox={`0 0 ${ovalWidth} ${ovalHeightPx}`}
+                      style={{ display: "block", cursor: "grab" }}
+                      role="img"
+                      aria-label="Oval: drag inside to move; when selected, drag on the image outside the oval to rotate or click without dragging to deselect; Alt+drag on oval to rotate; Shift+drag or wheel to resize width; drag corner squares to resize"
+                      aria-selected={ovalSelected}
+                      onPointerDown={handleOvalPointerDown}
+                      onPointerMove={handleOvalSvgPointerMove}
+                      onPointerEnter={handleOvalSvgPointerEnter}
+                      onPointerLeave={handleOvalSvgPointerLeave}
+                    >
+                      <ellipse
+                        cx={ovalCx}
+                        cy={ovalCy}
+                        rx={ovalErx}
+                        ry={ovalEry}
+                        fill="rgba(0,0,0,0.001)"
+                        stroke={ovalStrokeColor}
+                        strokeWidth={5}
+                        style={{ cursor: "inherit" }}
+                      />
+                      <rect
+                        x={ovalBoxLeft}
+                        y={ovalBoxTop}
+                        width={ovalBoxW}
+                        height={ovalBoxH}
+                        fill="none"
+                        stroke="#000000"
+                        strokeWidth={1.25}
+                        vectorEffect="non-scaling-stroke"
+                        pointerEvents="none"
+                      />
+                      <line
+                        x1={ovalCx - ovalCrosshairHalf}
+                        y1={ovalCy}
+                        x2={ovalCx + ovalCrosshairHalf}
+                        y2={ovalCy}
+                        stroke={ovalStrokeColor}
+                        strokeWidth={2}
+                        strokeLinecap="square"
+                        pointerEvents="none"
+                      />
+                      <line
+                        x1={ovalCx}
+                        y1={ovalCy - ovalCrosshairHalf}
+                        x2={ovalCx}
+                        y2={ovalCy + ovalCrosshairHalf}
+                        stroke={ovalStrokeColor}
+                        strokeWidth={2}
+                        strokeLinecap="square"
+                        pointerEvents="none"
+                      />
+                      {(
+                        [
+                          [ovalBoxLeft, ovalBoxTop],
+                          [ovalBoxLeft + ovalBoxW, ovalBoxTop],
+                          [ovalBoxLeft + ovalBoxW, ovalBoxTop + ovalBoxH],
+                          [ovalBoxLeft, ovalBoxTop + ovalBoxH],
+                        ] as const
+                      ).map(([bx, by], i) => (
+                        <rect
+                          key={i}
+                          x={bx - ovalBoundingCornerHalf}
+                          y={by - ovalBoundingCornerHalf}
+                          width={ovalBoundingCornerSize}
+                          height={ovalBoundingCornerSize}
+                          fill="#ffffff"
+                          stroke="#000000"
+                          strokeWidth={0.5}
+                          vectorEffect="non-scaling-stroke"
+                          style={{ cursor: "inherit" }}
+                        />
+                      ))}
+                    </svg>
+                  </div>
+                </div>
               </div>
             )}
             {currentUrl && (
