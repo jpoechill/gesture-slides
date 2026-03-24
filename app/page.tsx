@@ -2,9 +2,21 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-const APP_VERSION = "0.4.0";
+const APP_VERSION = "0.5.0";
 
 const VERSION_HISTORY: { version: string; date: string; changes: string[] }[] = [
+  {
+    version: "0.5.0",
+    date: "2026-03-24",
+    changes: [
+      "Oval: portrait defaults; width and height persisted; oval follows image pan, zoom, rotate, and flip",
+      "Oval bounding box (thin black) with white corner squares; drag corners to resize; mid-edge cap handles removed",
+      "Oval selection (yellow); short click on image outside oval deselects; drag there (past threshold) rotates; Alt+drag on oval rotates",
+      "Rotate and resize cursors (compact rotate icon on image when applicable)",
+      "Oval reset button; slideshow paused after folder pick until Play; image click no longer enters fullscreen",
+      "Landing copy for press-to-advance; localStorage migration when only legacy oval width was stored",
+    ],
+  },
   {
     version: "0.4.0",
     date: "2026-03-19",
