@@ -73,6 +73,8 @@ import {
   PER_IMAGE_BARE_NON_PENCIL_VERSION,
   defaultPerImageSlideData,
   hasPencilMarkings,
+  migrateLegacyPencilStrokesToUv,
+  pencilStrokeToDisplayPixels,
   perImageMarkupScore,
   readPerImageAggregateFromDirectory,
   resetNonPencilSlidesToBare,
@@ -133,7 +135,7 @@ function revokeSlidePrefetchMap(m: Map<string, string>) {
   m.clear();
 }
 
-/** Match main stage image layout: height = viewport, width from aspect (see current slide `<img>`). */
+/** Match main stage image layout: height = viewport, width from aspect (legacy pencil preview scaling). */
 function mainStageDisplaySizeForNatural(nw: number, nh: number): { refW: number; refH: number } {
   if (!nw || !nh || nh <= 0) return { refW: 1, refH: 1 };
   const refH = typeof window !== "undefined" ? window.innerHeight : 800;
@@ -141,13 +143,33 @@ function mainStageDisplaySizeForNatural(nw: number, nh: number): { refW: number;
   return { refW, refH };
 }
 
-function drawPencilStrokesPreviewScaled(
+function drawPencilStrokesInImageCssBox(
   ctx: CanvasRenderingContext2D,
   strokes: PencilStroke[],
-  scaleX: number,
-  scaleY: number
+  imgCssW: number,
+  imgCssH: number
 ) {
-  if (!strokes.length) return;
+  if (!strokes.length || !imgCssW || !imgCssH) return;
+  for (const stroke of strokes) {
+    const s = pencilStrokeToDisplayPixels(stroke, imgCssW, imgCssH);
+    drawSmoothPencilStroke(ctx, { ...s, size: Math.max(0.25, s.size) });
+  }
+}
+
+/** Pre-UV strokes in main-stage CSS pixels; scale into a mini preview box. */
+function drawLegacyPencilStrokesHudPreview(
+  ctx: CanvasRenderingContext2D,
+  strokes: PencilStroke[],
+  previewCssW: number,
+  previewCssH: number,
+  nw: number,
+  nh: number
+) {
+  if (!strokes.length || !previewCssW || !previewCssH) return;
+  const { refW, refH } = mainStageDisplaySizeForNatural(nw, nh);
+  if (!refW || !refH) return;
+  const scaleX = previewCssW / refW;
+  const scaleY = previewCssH / refH;
   const sLine = Math.min(scaleX, scaleY);
   for (const stroke of strokes) {
     drawSmoothPencilStroke(ctx, {
@@ -172,6 +194,8 @@ type HudMiniSlidePreviewProps = {
   corner: "left" | "right";
   /** When set, expanded preview is clickable to open that slide as the main image. */
   onPickSlide?: () => void;
+  /** False = stroke coords are legacy main-stage CSS pixels (HUD scales from ref layout). */
+  pencilStrokesUv: boolean;
 };
 
 function HudMiniSlidePreview(props: HudMiniSlidePreviewProps) {
@@ -186,6 +210,7 @@ function HudMiniSlidePreview(props: HudMiniSlidePreviewProps) {
     pencilRevision,
     corner,
     onPickSlide,
+    pencilStrokesUv,
   } = props;
   const imgRef = useRef<HTMLImageElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -201,10 +226,6 @@ function HudMiniSlidePreview(props: HudMiniSlidePreviewProps) {
     const pw = img.clientWidth;
     const ph = img.clientHeight;
     if (!pw || !ph) return;
-    const { refW, refH } = mainStageDisplaySizeForNatural(nw, nh);
-    if (!refW || !refH) return;
-    const scaleX = pw / refW;
-    const scaleY = ph / refH;
     const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
     const cw = Math.max(1, Math.round(pw * dpr));
     const ch = Math.max(1, Math.round(ph * dpr));
@@ -217,9 +238,10 @@ function HudMiniSlidePreview(props: HudMiniSlidePreviewProps) {
     ctx.clearRect(0, 0, cw, ch);
     ctx.save();
     ctx.scale(dpr, dpr);
-    drawPencilStrokesPreviewScaled(ctx, strokes, scaleX, scaleY);
+    if (pencilStrokesUv) drawPencilStrokesInImageCssBox(ctx, strokes, pw, ph);
+    else drawLegacyPencilStrokesHudPreview(ctx, strokes, pw, ph, nw, nh);
     ctx.restore();
-  }, [imageUrl, minimized, strokes, pencilRevision]);
+  }, [imageUrl, minimized, pencilStrokesUv, strokes, pencilRevision]);
 
   useLayoutEffect(() => {
     redraw();
@@ -4603,6 +4625,7 @@ export default function Page() {
       // Persist only pencil marks; shapes/guides/grids remain per-image but non-persistent.
       pencilOnly[key] = {
         ...defaultPerImageSlideData(),
+        pencilStrokesUv: d.pencilStrokesUv ?? true,
         pencilStrokes: structuredClone(d.pencilStrokes ?? []),
       };
     }
@@ -4628,6 +4651,7 @@ export default function Page() {
     if (!base) return;
     const full: PerImageSlideData = {
       ...base,
+      pencilStrokesUv: perImageSlideDataRef.current[key]?.pencilStrokesUv ?? true,
       pencilStrokes: structuredClone(pencilStrokesByImageRef.current[key] ?? []),
     };
     try {
@@ -4647,6 +4671,7 @@ export default function Page() {
     if (prev && prev !== currentImageKey && overlaySnapshotRef.current) {
       const snap: PerImageSlideData = {
         ...overlaySnapshotRef.current,
+        pencilStrokesUv: perImageSlideDataRef.current[prev]?.pencilStrokesUv ?? true,
         pencilStrokes: structuredClone(pencilStrokesByImageRef.current[prev] ?? []),
       };
       perImageSlideDataRef.current = { ...perImageSlideDataRef.current, [prev]: snap };
@@ -4724,6 +4749,7 @@ export default function Page() {
       box3dPitchDeg,
       box3dOffsetX,
       box3dOffsetY,
+      pencilStrokesUv: true,
       pencilStrokes: [],
     };
     overlaySnapshotRef.current = snap;
@@ -4735,8 +4761,10 @@ export default function Page() {
       if (currentImageKeyRef.current !== key) return;
       const base = overlaySnapshotRef.current;
       if (!base) return;
+      const priorSlide = perImageSlideDataRef.current[key];
       perImageSlideDataRef.current[key] = {
         ...base,
+        pencilStrokesUv: priorSlide?.pencilStrokesUv ?? true,
         pencilStrokes: structuredClone(pencilStrokesByImageRef.current[key] ?? []),
       };
       schedulePerImageAggregateFlush();
@@ -4826,10 +4854,17 @@ export default function Page() {
         ? imageOriginInPencilCanvasCss(canvas, img)
         : { ox: 0, oy: 0 };
     ctx.translate(oxoy.ox, oxoy.oy);
+    const cw = img?.clientWidth ?? 0;
+    const ch = img?.clientHeight ?? 0;
+    const slideUv = perImageSlideDataRef.current[currentImageKey]?.pencilStrokesUv ?? true;
     const strokes = pencilStrokesByImageRef.current[currentImageKey] ?? [];
-    for (const stroke of strokes) drawSmoothPencilStroke(ctx, stroke);
     const draft = pencilDraftRef.current;
-    if (draft) drawSmoothPencilStroke(ctx, draft);
+    for (const stroke of strokes) {
+      if (draft && stroke === draft) drawSmoothPencilStroke(ctx, stroke);
+      else if (slideUv && cw > 0 && ch > 0)
+        drawSmoothPencilStroke(ctx, pencilStrokeToDisplayPixels(stroke, cw, ch));
+      else drawSmoothPencilStroke(ctx, stroke);
+    }
     ctx.restore();
   }, [currentImageKey]);
 
@@ -4866,6 +4901,24 @@ export default function Page() {
     if (!pencilEnabled && pencilMoveAllMode) setPencilMoveAllMode(false);
   }, [pencilEnabled, pencilMoveAllMode]);
 
+  useLayoutEffect(() => {
+    const key = currentImageKey;
+    if (!key) return;
+    const d = perImageSlideDataRef.current[key];
+    const live = pencilStrokesByImageRef.current[key];
+    if (!d || !live?.length || d.pencilStrokesUv) return;
+    const img = currentImgRef.current;
+    if (!img?.complete || !img.naturalWidth || !img.naturalHeight) return;
+    const cw = img.clientWidth;
+    const ch = img.clientHeight;
+    if (!cw || !ch) return;
+    migrateLegacyPencilStrokesToUv(live, cw, ch);
+    d.pencilStrokes = structuredClone(live);
+    d.pencilStrokesUv = true;
+    setPencilNonce((n) => n + 1);
+    schedulePerImageAggregateFlush();
+  }, [currentImageKey, currentUrl, imageMeta.width, imageMeta.height, schedulePerImageAggregateFlush]);
+
   const handlePencilPointerDown = useCallback((e: React.PointerEvent<HTMLCanvasElement>) => {
     if (!pencilEnabled || !currentImageKey) return;
     const canvas = e.currentTarget;
@@ -4897,10 +4950,25 @@ export default function Page() {
         const dx = next.x - prev.x;
         const dy = next.y - prev.y;
         if (Math.hypot(dx, dy) < 0.01) return;
-        for (const stroke of all) {
-          for (const p of stroke.points) {
-            p.x += dx;
-            p.y += dy;
+        const imgM = currentImgRef.current;
+        const icw = imgM?.clientWidth ?? 1;
+        const ich = imgM?.clientHeight ?? 1;
+        const slideUv = perImageSlideDataRef.current[currentImageKey]?.pencilStrokesUv ?? true;
+        if (slideUv) {
+          const du = dx / icw;
+          const dv = dy / ich;
+          for (const stroke of all) {
+            for (const p of stroke.points) {
+              p.x += du;
+              p.y += dv;
+            }
+          }
+        } else {
+          for (const stroke of all) {
+            for (const p of stroke.points) {
+              p.x += dx;
+              p.y += dy;
+            }
           }
         }
         prev = next;
@@ -4971,6 +5039,24 @@ export default function Page() {
           finalized.points = smoothPencilPoints(base, iterations);
         } else {
           finalized.points = base;
+        }
+        const imgFin = currentImgRef.current;
+        if (imgFin && imgFin.clientWidth > 0 && imgFin.clientHeight > 0) {
+          const fcw = imgFin.clientWidth;
+          const fch = imgFin.clientHeight;
+          const fm = Math.min(fcw, fch);
+          for (const p of finalized.points) {
+            p.x /= fcw;
+            p.y /= fch;
+          }
+          finalized.size /= fm;
+        }
+        const rowKey = currentImageKeyRef.current;
+        if (rowKey) {
+          if (!perImageSlideDataRef.current[rowKey]) {
+            perImageSlideDataRef.current[rowKey] = defaultPerImageSlideData();
+          }
+          perImageSlideDataRef.current[rowKey]!.pencilStrokesUv = true;
         }
       }
       pencilDraftRef.current = null;
@@ -5171,6 +5257,7 @@ export default function Page() {
       if (!base) return perImageSlideDataRef.current[key] ?? null;
       return {
         ...base,
+        pencilStrokesUv: perImageSlideDataRef.current[key]?.pencilStrokesUv ?? true,
         pencilStrokes: structuredClone(pencilStrokesByImageRef.current[key] ?? []),
       };
     }
@@ -7979,6 +8066,7 @@ export default function Page() {
                           pencilRevision={pencilNonce + undoStackVersion}
                           corner="left"
                           onPickSlide={() => goToHudNeighborFile(hudNeighborFiles.p0)}
+                          pencilStrokesUv={perImageSlideDataRef.current[hudNeighborFiles.p0.name]?.pencilStrokesUv ?? true}
                         />
                       ) : null}
                       {hudNeighborFiles.p1 && hudNeighborUrls.p1 ? (
@@ -7996,6 +8084,7 @@ export default function Page() {
                           pencilRevision={pencilNonce + undoStackVersion}
                           corner="left"
                           onPickSlide={() => goToHudNeighborFile(hudNeighborFiles.p1)}
+                          pencilStrokesUv={perImageSlideDataRef.current[hudNeighborFiles.p1.name]?.pencilStrokesUv ?? true}
                         />
                       ) : null}
                       {renderBottomHudChromeToggle({ alignSelf: prevHudMinimized ? "center" : "flex-start" })}
@@ -8040,6 +8129,7 @@ export default function Page() {
                           pencilRevision={pencilNonce + undoStackVersion}
                           corner="right"
                           onPickSlide={() => goToHudNeighborFile(hudNeighborFiles.n0)}
+                          pencilStrokesUv={perImageSlideDataRef.current[hudNeighborFiles.n0.name]?.pencilStrokesUv ?? true}
                         />
                       ) : null}
                       {hudNeighborFiles.n1 && hudNeighborUrls.n1 ? (
@@ -8057,6 +8147,7 @@ export default function Page() {
                           pencilRevision={pencilNonce + undoStackVersion}
                           corner="right"
                           onPickSlide={() => goToHudNeighborFile(hudNeighborFiles.n1)}
+                          pencilStrokesUv={perImageSlideDataRef.current[hudNeighborFiles.n1.name]?.pencilStrokesUv ?? true}
                         />
                       ) : null}
                     </div>

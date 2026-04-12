@@ -75,6 +75,11 @@ export type PerImageSlideData = {
   box3dPitchDeg: number;
   box3dOffsetX: number;
   box3dOffsetY: number;
+  /**
+   * When true, each stroke point is (x,y) in 0–1 of the slide image's rendered width/height at draw time,
+   * and stroke.size is line width relative to min(rendered width, height). Legacy false = image-local CSS pixels.
+   */
+  pencilStrokesUv: boolean;
   pencilStrokes: PencilStroke[];
 };
 
@@ -132,6 +137,7 @@ export function defaultPerImageSlideData(): PerImageSlideData {
     box3dPitchDeg: DEFAULT_SETTINGS.box3dPitchDeg,
     box3dOffsetX: DEFAULT_SETTINGS.box3dOffsetX,
     box3dOffsetY: DEFAULT_SETTINGS.box3dOffsetY,
+    pencilStrokesUv: true,
     pencilStrokes: [],
   };
 }
@@ -225,6 +231,7 @@ export function perImageMarkupScore(d: PerImageSlideData): number {
     "box3dPitchDeg",
     "box3dOffsetX",
     "box3dOffsetY",
+    "pencilStrokesUv",
   ];
   for (const k of fields) {
     const a = d[k];
@@ -236,6 +243,29 @@ export function perImageMarkupScore(d: PerImageSlideData): number {
     }
   }
   return score;
+}
+
+/** Legacy strokes: image-local CSS pixels + absolute line width. Converts in place to UV + relative size. */
+export function migrateLegacyPencilStrokesToUv(strokes: PencilStroke[], cw: number, ch: number) {
+  if (!cw || !ch) return;
+  const m = Math.min(cw, ch) || 1;
+  for (const st of strokes) {
+    for (const p of st.points) {
+      p.x /= cw;
+      p.y /= ch;
+    }
+    st.size /= m;
+  }
+}
+
+/** Map UV-space stroke to current image CSS pixel box (for canvas draw). */
+export function pencilStrokeToDisplayPixels(stroke: PencilStroke, cw: number, ch: number): PencilStroke {
+  const m = Math.min(cw, ch) || 1;
+  return {
+    color: stroke.color,
+    size: stroke.size * m,
+    points: stroke.points.map((p) => ({ x: p.x * cw, y: p.y * ch })),
+  };
 }
 
 export function sanitizePencilStrokes(raw: unknown): PencilStroke[] {
@@ -355,6 +385,11 @@ export function sanitizePerImageSlideData(raw: unknown): PerImageSlideData | nul
   d.box3dOffsetX = num(o.box3dOffsetX, d.box3dOffsetX, -4000, 4000);
   d.box3dOffsetY = num(o.box3dOffsetY, d.box3dOffsetY, -4000, 4000);
   d.pencilStrokes = sanitizePencilStrokes(o.pencilStrokes);
+  if (!d.pencilStrokes.length) {
+    d.pencilStrokesUv = true;
+  } else {
+    d.pencilStrokesUv = bool(o.pencilStrokesUv, false);
+  }
   return d;
 }
 
