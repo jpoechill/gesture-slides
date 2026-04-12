@@ -13,9 +13,9 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Gesture Slideshow",
+  title: "Gesture Trainer",
   description:
-    "Shuffle and auto-advance images from a folder on your device—fullscreen viewing, zoom and pan, metadata and adjustments, and slideshow controls in the browser (Chrome/Edge).",
+    "Train gesture drawing with images from a folder on your device—shuffle and timed practice, overlays, pencil, and per-slide layout in the browser (Chrome/Edge).",
 };
 
 export default function RootLayout({

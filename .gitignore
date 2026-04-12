@@ -24,6 +24,9 @@
 .DS_Store
 *.pem
 
+# Dev artifact: per-folder aggregate lives under picked image directories, not the repo root
+/.gesture-slideshow-slides.json
+
 # debug
 npm-debug.log*
 yarn-debug.log*
