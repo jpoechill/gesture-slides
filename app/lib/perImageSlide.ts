@@ -261,21 +261,28 @@ export function migrateLegacyPencilStrokesToUv(strokes: PencilStroke[], cw: numb
 /** Map UV-space stroke to current image CSS pixel box (for canvas draw). */
 export function pencilStrokeToDisplayPixels(stroke: PencilStroke, cw: number, ch: number): PencilStroke {
   const m = Math.min(cw, ch) || 1;
+  // Defensive fallback: UV widths are relative (typically << 1). If a bad value was loaded
+  // as an absolute px width, keep it in px instead of multiplying by image size.
+  const sizePx = stroke.size <= 1 ? stroke.size * m : stroke.size;
   return {
     color: stroke.color,
-    size: stroke.size * m,
+    size: sizePx,
     points: stroke.points.map((p) => ({ x: p.x * cw, y: p.y * ch })),
   };
 }
 
-export function sanitizePencilStrokes(raw: unknown): PencilStroke[] {
+export function sanitizePencilStrokes(raw: unknown, opts?: { uv?: boolean }): PencilStroke[] {
   if (!Array.isArray(raw)) return [];
+  const uv = opts?.uv === true;
   const out: PencilStroke[] = [];
   for (const item of raw) {
     if (!item || typeof item !== "object") continue;
     const o = item as Record<string, unknown>;
     const color = typeof o.color === "string" && o.color ? o.color : "#ff3b30";
-    const size = Math.min(24, Math.max(1, Number(o.size) || 4));
+    const n = Number(o.size);
+    const size = uv
+      ? Math.min(0.5, Math.max(1e-4, Number.isFinite(n) ? n : 0.004))
+      : Math.min(24, Math.max(1, Number.isFinite(n) ? n : 4));
     const ptsRaw = o.points;
     if (!Array.isArray(ptsRaw)) continue;
     const points: PencilPoint[] = [];
@@ -384,11 +391,14 @@ export function sanitizePerImageSlideData(raw: unknown): PerImageSlideData | nul
   d.box3dPitchDeg = num(o.box3dPitchDeg, d.box3dPitchDeg, -180, 180);
   d.box3dOffsetX = num(o.box3dOffsetX, d.box3dOffsetX, -4000, 4000);
   d.box3dOffsetY = num(o.box3dOffsetY, d.box3dOffsetY, -4000, 4000);
-  d.pencilStrokes = sanitizePencilStrokes(o.pencilStrokes);
+  const pencilStrokesRaw = o.pencilStrokes;
+  const hasStrokeArray = Array.isArray(pencilStrokesRaw) && pencilStrokesRaw.length > 0;
+  const parsedUv = hasStrokeArray ? bool(o.pencilStrokesUv, false) : true;
+  d.pencilStrokes = sanitizePencilStrokes(pencilStrokesRaw, { uv: parsedUv });
   if (!d.pencilStrokes.length) {
     d.pencilStrokesUv = true;
   } else {
-    d.pencilStrokesUv = bool(o.pencilStrokesUv, false);
+    d.pencilStrokesUv = parsedUv;
   }
   return d;
 }

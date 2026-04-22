@@ -15,10 +15,19 @@ export function drawSmoothPencilStroke(ctx: CanvasRenderingContext2D, stroke: Pe
     ctx.fill();
     return;
   }
+  const finite = pts.filter((p) => p && Number.isFinite(p.x) && Number.isFinite(p.y));
+  if (finite.length < 2) return;
+  const p0 = finite[0]!;
+  const pl = finite[finite.length - 1]!;
+  const closeEps = Math.max(1e-3, stroke.size * 0.05);
+  const closed =
+    finite.length >= 3 && Math.hypot(p0.x - pl.x, p0.y - pl.y) < closeEps;
   // Always draw as a polyline (vectors), not a Bezier curve.
   ctx.beginPath();
-  ctx.moveTo(pts[0]!.x, pts[0]!.y);
-  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i]!.x, pts[i]!.y);
+  ctx.moveTo(p0.x, p0.y);
+  const end = closed ? finite.length - 1 : finite.length;
+  for (let i = 1; i < end; i++) ctx.lineTo(finite[i]!.x, finite[i]!.y);
+  if (closed) ctx.closePath();
   ctx.stroke();
 }
 
@@ -296,6 +305,121 @@ export function trySnapStrokeToEllipse(points: PencilPoint[], strokeSize: number
   }
   meanErr /= points.length;
   if (meanErr > 0.23) return null;
+
+  /**
+   * Axis-aligned box fit in a rotated frame: mean |max(|u|/hu,|v|/hv) − 1|.
+   * PCA orientation is wrong for squares (isotropic covariance → arbitrary θ); edge midpoints
+   * then sit "inside" the PCA box and inflate error. Scan φ ∈ [0, π/2) to find the box that
+   * actually matches the stroke.
+   */
+  const rectOrientSteps = 48;
+  let bestRectErr = Infinity;
+  let bestRc = 1;
+  let bestRs = 0;
+  const thetaPca = Math.atan2(s, c);
+  const extraPhis = [thetaPca, thetaPca + Math.PI / 4];
+  const tryPhi = (phi: number) => {
+    const rc = Math.cos(phi);
+    const rs = Math.sin(phi);
+    let lhu = 0;
+    let lhv = 0;
+    for (const p of points) {
+      const dx = p.x - cx;
+      const dy = p.y - cy;
+      const u = rc * dx + rs * dy;
+      const v = -rs * dx + rc * dy;
+      const au = Math.abs(u);
+      const av = Math.abs(v);
+      if (au > lhu) lhu = au;
+      if (av > lhv) lhv = av;
+    }
+    if (lhu < 1e-6 || lhv < 1e-6) return;
+    let err = 0;
+    for (const p of points) {
+      const dx = p.x - cx;
+      const dy = p.y - cy;
+      const u = rc * dx + rs * dy;
+      const v = -rs * dx + rc * dy;
+      const m = Math.max(Math.abs(u) / lhu, Math.abs(v) / lhv);
+      err += Math.abs(m - 1);
+    }
+    err /= points.length;
+    if (err < bestRectErr) {
+      bestRectErr = err;
+      bestRc = rc;
+      bestRs = rs;
+    }
+  };
+  const modHalfPi = (phi: number) => ((phi % (Math.PI / 2)) + Math.PI / 2) % (Math.PI / 2);
+  for (const phi of extraPhis) tryPhi(modHalfPi(phi));
+  for (let k = 0; k < rectOrientSteps; k++) tryPhi((k / rectOrientSteps) * (Math.PI / 2));
+
+  const preferRectangle =
+    Number.isFinite(bestRectErr) && bestRectErr < meanErr + 0.01 && bestRectErr < 0.15;
+
+  if (preferRectangle) {
+    /**
+     * Use the axis-aligned bbox in the best φ frame (min/max of u,v about the stroke mean),
+     * not ±max|u|,±max|v| about the centroid. The mean is rarely the rectangle center when
+     * sampling along edges is uneven; the old box was shifted and could shoot a corner to
+     * the image origin (top-left in image-relative coords).
+     */
+    let uMin = Infinity;
+    let uMax = -Infinity;
+    let vMin = Infinity;
+    let vMax = -Infinity;
+    for (const p of points) {
+      const dx = p.x - cx;
+      const dy = p.y - cy;
+      const u = bestRc * dx + bestRs * dy;
+      const v = -bestRs * dx + bestRc * dy;
+      if (u < uMin) uMin = u;
+      if (u > uMax) uMax = u;
+      if (v < vMin) vMin = v;
+      if (v > vMax) vMax = v;
+    }
+    const du = uMax - uMin;
+    const dv = vMax - vMin;
+    if (
+      du >= Math.max(8, strokeSize * 1.2) &&
+      dv >= Math.max(8, strokeSize * 1.2) &&
+      du > 1e-6 &&
+      dv > 1e-6
+    ) {
+      /** Walk perimeter CCW in (u,v): top edge u_max→u_min at v_max, etc. */
+      const cornersUv: PencilPoint[] = [
+        { x: uMax, y: vMax },
+        { x: uMin, y: vMax },
+        { x: uMin, y: vMin },
+        { x: uMax, y: vMin },
+      ];
+      const corners = cornersUv.map(({ x: uu, y: vv }) => ({
+        x: cx + bestRc * uu - bestRs * vv,
+        y: cy + bestRs * uu + bestRc * vv,
+      }));
+      let best = 0;
+      let bestD2 = Infinity;
+      for (let i = 0; i < 4; i++) {
+        const q = corners[i]!;
+        const d2 = (q.x - start.x) * (q.x - start.x) + (q.y - start.y) * (q.y - start.y);
+        if (d2 < bestD2) {
+          bestD2 = d2;
+          best = i;
+        }
+      }
+      const out: PencilPoint[] = [];
+      for (let k = 0; k <= 4; k++) {
+        const j = (best + k) % 4;
+        const q = corners[j]!;
+        // Clone each vertex: k=0 and k=4 reuse the same corner index but must be
+        // separate objects — finalize divides every point by image size; a shared ref
+        // would be divided twice and land near the top-left (wrong closing point).
+        out.push({ x: q.x, y: q.y });
+      }
+      return out;
+    }
+    // Degenerate in uv; fall through to ellipse.
+  }
 
   const perimeterApprox = 2 * Math.PI * Math.sqrt((rx * rx + ry * ry) / 2);
   const samples = Math.min(220, Math.max(72, Math.round(perimeterApprox / 3)));

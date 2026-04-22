@@ -37,6 +37,8 @@ export const DEFAULT_SETTINGS = {
   pencilColor: "#ff3b30",
   /** 0–100: higher = smoother curves / more simplification. */
   pencilCurveSensitivity: 65,
+  /** 0 = off. When a finished pencil stroke brings the current slide's stroke count to exactly this number, advance to the next image. */
+  strokeAdvanceTarget: 0,
   showCenterFrame: false,
   showGrid: false,
   gridCellSize: 48,

@@ -8,6 +8,7 @@ export const SIDEBAR_SECTION_IDS = [
   "rectangle",
   "box3d",
   "pencil",
+  "strokeCounter",
   "adjustImage",
 ] as const;
 export type SidebarSectionId = (typeof SIDEBAR_SECTION_IDS)[number];
@@ -26,7 +27,7 @@ export const DEFAULT_SIDEBAR_LEFT: SidebarSectionId[] = [
   "pose",
   "box3d",
 ];
-export const DEFAULT_SIDEBAR_RIGHT: SidebarSectionId[] = ["adjustImage", "pencil"];
+export const DEFAULT_SIDEBAR_RIGHT: SidebarSectionId[] = ["adjustImage", "pencil", "strokeCounter"];
 
 /** Shown only on the Archive tab; all other sections stay on Main. */
 export const ARCHIVE_SECTION_IDS = new Set<SidebarSectionId>([
@@ -53,6 +54,7 @@ export const SIDEBAR_SECTION_LABEL: Record<SidebarSectionId, string> = {
   rectangle: "Rectangle",
   box3d: "3D box",
   pencil: "Pencil",
+  strokeCounter: "Stroke counter",
   adjustImage: "Adjust image",
 };
 
@@ -97,7 +99,7 @@ export function normalizeSidebarColumns(
   for (const id of SIDEBAR_SECTION_IDS) {
     if (!assigned.has(id)) {
       assigned.add(id);
-      if (id === "adjustImage" || id === "pencil") outRight.push(id);
+      if (id === "adjustImage" || id === "pencil" || id === "strokeCounter") outRight.push(id);
       else outLeft.push(id);
     }
   }

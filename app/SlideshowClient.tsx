@@ -150,9 +150,13 @@ function drawPencilStrokesInImageCssBox(
   imgCssH: number
 ) {
   if (!strokes.length || !imgCssW || !imgCssH) return;
+  const maxPreviewStrokePx = Math.max(0.75, Math.min(2.5, Math.min(imgCssW, imgCssH) * 0.015));
   for (const stroke of strokes) {
     const s = pencilStrokeToDisplayPixels(stroke, imgCssW, imgCssH);
-    drawSmoothPencilStroke(ctx, { ...s, size: Math.max(0.25, s.size) });
+    drawSmoothPencilStroke(ctx, {
+      ...s,
+      size: Math.min(maxPreviewStrokePx, Math.max(0.2, s.size)),
+    });
   }
 }
 
@@ -171,13 +175,33 @@ function drawLegacyPencilStrokesHudPreview(
   const scaleX = previewCssW / refW;
   const scaleY = previewCssH / refH;
   const sLine = Math.min(scaleX, scaleY);
+  const maxPreviewStrokePx = Math.max(0.75, Math.min(2.5, Math.min(previewCssW, previewCssH) * 0.015));
   for (const stroke of strokes) {
     drawSmoothPencilStroke(ctx, {
       color: stroke.color,
-      size: Math.max(0.25, stroke.size * sLine),
+      size: Math.min(maxPreviewStrokePx, Math.max(0.2, stroke.size * sLine)),
       points: stroke.points.map((p) => ({ x: p.x * scaleX, y: p.y * scaleY })),
     });
   }
+}
+
+/**
+ * Defensive heuristic for old/mis-saved data:
+ * UV strokes should mostly be inside [0,1] (with tiny tolerance).
+ */
+function looksLikeUvStrokeCoordinates(strokes: PencilStroke[]): boolean {
+  let total = 0;
+  let outside = 0;
+  for (const stroke of strokes) {
+    for (const p of stroke.points) {
+      total += 1;
+      if (!Number.isFinite(p.x) || !Number.isFinite(p.y) || p.x < -0.25 || p.x > 1.25 || p.y < -0.25 || p.y > 1.25) {
+        outside += 1;
+      }
+    }
+  }
+  if (!total) return true;
+  return outside / total < 0.2;
 }
 
 const EMPTY_PENCIL_PREVIEW: PencilStroke[] = [];
@@ -238,7 +262,8 @@ function HudMiniSlidePreview(props: HudMiniSlidePreviewProps) {
     ctx.clearRect(0, 0, cw, ch);
     ctx.save();
     ctx.scale(dpr, dpr);
-    if (pencilStrokesUv) drawPencilStrokesInImageCssBox(ctx, strokes, pw, ph);
+    const useUv = pencilStrokesUv && looksLikeUvStrokeCoordinates(strokes);
+    if (useUv) drawPencilStrokesInImageCssBox(ctx, strokes, pw, ph);
     else drawLegacyPencilStrokesHudPreview(ctx, strokes, pw, ph, nw, nh);
     ctx.restore();
   }, [imageUrl, minimized, pencilStrokesUv, strokes, pencilRevision]);
@@ -1177,6 +1202,8 @@ export default function Page() {
   /** Always matches idxInOrder so interval callbacks can compute advance synchronously (React may defer setState updaters). */
   const idxInOrderRef = useRef(0);
   idxInOrderRef.current = idxInOrder;
+  /** Pending stroke-based auto-advance after N strokes (cleared on slide/settings change). */
+  const strokeAdvanceTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const storedSettings = useMemo(() => loadStoredSettings(), []);
 
@@ -1272,6 +1299,12 @@ export default function Page() {
     const v = Number(storedSettings.pencilCurveSensitivity);
     return Math.min(100, Math.max(0, Number.isFinite(v) ? v : DEFAULT_SETTINGS.pencilCurveSensitivity));
   });
+  const [strokeAdvanceTarget, setStrokeAdvanceTarget] = useState(() => {
+    const t = Math.floor(Number(storedSettings.strokeAdvanceTarget));
+    return Number.isFinite(t) ? Math.min(999, Math.max(0, t)) : DEFAULT_SETTINGS.strokeAdvanceTarget;
+  });
+  const strokeAdvanceTargetRef = useRef(strokeAdvanceTarget);
+  strokeAdvanceTargetRef.current = strokeAdvanceTarget;
   const [pencilNonce, setPencilNonce] = useState(0);
   const [pencilMoveAllMode, setPencilMoveAllMode] = useState(false);
   /** Bumps when the per-image undo stack is pushed so sidebar can refresh "Undo" enabled state. */
@@ -3950,8 +3983,6 @@ export default function Page() {
     [panX, panY, imageScale, imageRotate]
   );
   const [isPanning, setIsPanning] = useState(false);
-  /** Space held: pan-only overlay (grab) over the stage; ignores shape/pencil hit targets. */
-  const [spacePanActive, setSpacePanActive] = useState(false);
   /** When oval is selected, show rotate cursor over the image outside the oval widget. */
   const [deckCursorMode, setDeckCursorMode] = useState<"grab" | "rotate">("grab");
   const panStartRef = useRef<{ startX: number; startY: number; startPanX: number; startPanY: number } | null>(null);
@@ -3981,6 +4012,7 @@ export default function Page() {
   const [rectangleExpanded, setRectangleExpanded] = useState(false);
   const [box3dExpanded, setBox3dExpanded] = useState(false);
   const [pencilExpanded, setPencilExpanded] = useState(false);
+  const [strokeCounterExpanded, setStrokeCounterExpanded] = useState(true);
   const [adjustImageExpanded, setAdjustImageExpanded] = useState(false);
   const initialSidebarColumns = normalizeSidebarColumns(
     storedSettings.leftPanelSectionOrder,
@@ -4162,6 +4194,12 @@ export default function Page() {
         Math.min(100, Math.max(0, Number.isFinite(v) ? v : DEFAULT_SETTINGS.pencilCurveSensitivity))
       );
     }
+    {
+      const t = Math.floor(Number(s.strokeAdvanceTarget));
+      setStrokeAdvanceTarget(
+        Number.isFinite(t) ? Math.min(999, Math.max(0, t)) : DEFAULT_SETTINGS.strokeAdvanceTarget
+      );
+    }
     setShowCenterFrame(s.showCenterFrame !== false);
     setShowGrid(s.showGrid !== false);
     setGridCellSize(Math.min(200, Math.max(16, Number(s.gridCellSize) || 48)));
@@ -4257,6 +4295,7 @@ export default function Page() {
       pencilSize,
       pencilColor,
       pencilCurveSensitivity,
+      strokeAdvanceTarget,
       showCenterFrame,
       showGrid,
       gridCellSize,
@@ -4317,9 +4356,10 @@ export default function Page() {
     pencilEnabled,
     pencilSize,
     pencilColor,
-    pencilCurveSensitivity,
-    showCenterFrame,
-    showGrid,
+      pencilCurveSensitivity,
+      strokeAdvanceTarget,
+      showCenterFrame,
+      showGrid,
     gridCellSize,
     centerFrameSize,
     centerFrameLabelSize,
@@ -4547,6 +4587,27 @@ export default function Page() {
   const currentImageKey = currentFile?.name ?? "";
   currentImageKeyRef.current = currentImageKey;
 
+  useEffect(() => {
+    return () => {
+      if (strokeAdvanceTimeoutRef.current) {
+        clearTimeout(strokeAdvanceTimeoutRef.current);
+        strokeAdvanceTimeoutRef.current = null;
+      }
+    };
+  }, [currentImageKey, strokeAdvanceTarget]);
+
+  const clearPencilDrawingForCurrentImage = useCallback(() => {
+    const key = currentImageKeyRef.current;
+    if (!key) return;
+    if (strokeAdvanceTimeoutRef.current) {
+      clearTimeout(strokeAdvanceTimeoutRef.current);
+      strokeAdvanceTimeoutRef.current = null;
+    }
+    pencilStrokesByImageRef.current[key] = [];
+    pencilDraftRef.current = null;
+    setPencilNonce((n) => n + 1);
+  }, []);
+
   const applyPerImageSlideData = useCallback((d: PerImageSlideData) => {
     setPanX(d.panX);
     setPanY(d.panY);
@@ -4684,7 +4745,15 @@ export default function Page() {
     const saved = perImageSlideDataRef.current[currentImageKey];
     if (saved) {
       applyPerImageSlideData(saved);
-      pencilStrokesByImageRef.current[currentImageKey] = structuredClone(saved.pencilStrokes ?? []);
+      const savedStrokes = structuredClone(saved.pencilStrokes ?? []);
+      const target = strokeAdvanceTargetRef.current;
+      if (target > 0 && savedStrokes.length >= target) {
+        saved.pencilStrokes = [];
+        pencilStrokesByImageRef.current[currentImageKey] = [];
+        schedulePerImageAggregateFlush();
+      } else {
+        pencilStrokesByImageRef.current[currentImageKey] = savedStrokes;
+      }
       setPencilNonce((n) => n + 1);
     } else {
       // Ensure overlays/shapes are unique per image (no bleed from the previous slide).
@@ -4863,7 +4932,8 @@ export default function Page() {
       if (draft && stroke === draft) drawSmoothPencilStroke(ctx, stroke);
       else if (slideUv && cw > 0 && ch > 0)
         drawSmoothPencilStroke(ctx, pencilStrokeToDisplayPixels(stroke, cw, ch));
-      else drawSmoothPencilStroke(ctx, stroke);
+      else if (!slideUv) drawSmoothPencilStroke(ctx, stroke);
+      // slideUv but image not laid out yet: skip (raw UV would draw as ~0–1 px at top-left).
     }
     ctx.restore();
   }, [currentImageKey]);
@@ -5019,7 +5089,9 @@ export default function Page() {
     };
     const onUp = () => {
       const finalized = pencilDraftRef.current;
+      let finishedStroke = false;
       if (finalized) {
+        finishedStroke = true;
         // 0% = follow user input more closely (more points, less simplification)
         // 100% = more solid/smoothed curve (fewer points, more simplification)
         const smoothStrength = Math.max(0, Math.min(1, pencilCurveSensitivity / 100));
@@ -5041,6 +5113,7 @@ export default function Page() {
           finalized.points = base;
         }
         const imgFin = currentImgRef.current;
+        const rowKey = currentImageKeyRef.current;
         if (imgFin && imgFin.clientWidth > 0 && imgFin.clientHeight > 0) {
           const fcw = imgFin.clientWidth;
           const fch = imgFin.clientHeight;
@@ -5050,13 +5123,18 @@ export default function Page() {
             p.y /= fch;
           }
           finalized.size /= fm;
-        }
-        const rowKey = currentImageKeyRef.current;
-        if (rowKey) {
+          if (rowKey) {
+            if (!perImageSlideDataRef.current[rowKey]) {
+              perImageSlideDataRef.current[rowKey] = defaultPerImageSlideData();
+            }
+            perImageSlideDataRef.current[rowKey]!.pencilStrokesUv = true;
+          }
+        } else if (rowKey) {
           if (!perImageSlideDataRef.current[rowKey]) {
             perImageSlideDataRef.current[rowKey] = defaultPerImageSlideData();
           }
-          perImageSlideDataRef.current[rowKey]!.pencilStrokesUv = true;
+          // Strokes are still image-local CSS pixels; do not mark UV until we convert.
+          perImageSlideDataRef.current[rowKey]!.pencilStrokesUv = false;
         }
       }
       pencilDraftRef.current = null;
@@ -5070,11 +5148,43 @@ export default function Page() {
       window.removeEventListener("pointercancel", onUp);
       redrawPencilCanvas();
       setPencilNonce((n) => n + 1);
+      if (finishedStroke && order.length > 0 && strokeAdvanceTarget > 0) {
+        const rk = currentImageKeyRef.current;
+        if (rk) {
+          const nStrokes = pencilStrokesByImageRef.current[rk]?.length ?? 0;
+          if (nStrokes > strokeAdvanceTarget) {
+            clearPencilDrawingForCurrentImage();
+          } else if (nStrokes === strokeAdvanceTarget) {
+            const len = Math.max(1, order.length);
+            if (strokeAdvanceTimeoutRef.current) {
+              clearTimeout(strokeAdvanceTimeoutRef.current);
+              strokeAdvanceTimeoutRef.current = null;
+            }
+            // Let the finalized stroke paint, then advance immediately.
+            requestAnimationFrame(() => {
+              requestAnimationFrame(() => {
+                setIdxInOrder((v) => (v + 1) % len);
+              });
+            });
+          }
+        }
+      }
     };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
     window.addEventListener("pointercancel", onUp);
-  }, [currentImageKey, pencilEnabled, pencilMoveAllMode, pencilColor, pencilSize, pencilCurveSensitivity, redrawPencilCanvas]);
+  }, [
+    currentImageKey,
+    pencilEnabled,
+    pencilMoveAllMode,
+    pencilColor,
+    pencilSize,
+    pencilCurveSensitivity,
+    strokeAdvanceTarget,
+    order,
+    redrawPencilCanvas,
+    clearPencilDrawingForCurrentImage,
+  ]);
 
   const pencilUndoStrokeOnly = useCallback(() => {
     if (!currentImageKey) return;
@@ -5608,34 +5718,6 @@ export default function Page() {
     };
   }, [isPanning]);
 
-  useEffect(() => {
-    if (!currentUrl) return;
-    function clearSpacePan() {
-      flushSync(() => setSpacePanActive(false));
-    }
-    function onKeyDown(e: KeyboardEvent) {
-      if (e.code !== "Space" && e.key !== " ") return;
-      if (isEditableTextKeyboardTarget(e.target)) return;
-      e.preventDefault();
-      if (e.repeat) return;
-      // Commit before returning to the browser so the pan overlay mounts and wins z-order
-      // (otherwise grab can lag a frame behind shapes/pencil cursors).
-      flushSync(() => setSpacePanActive(true));
-    }
-    function onKeyUp(e: KeyboardEvent) {
-      if (e.code !== "Space" && e.key !== " ") return;
-      clearSpacePan();
-    }
-    window.addEventListener("keydown", onKeyDown, true);
-    window.addEventListener("keyup", onKeyUp, true);
-    window.addEventListener("blur", clearSpacePan);
-    return () => {
-      window.removeEventListener("keydown", onKeyDown, true);
-      window.removeEventListener("keyup", onKeyUp, true);
-      window.removeEventListener("blur", clearSpacePan);
-    };
-  }, [currentUrl]);
-
   // Timer logic
   useEffect(() => {
     if (timerRef.current) {
@@ -5790,13 +5872,14 @@ export default function Page() {
         return;
       }
 
-      // X: exit pencil (ignore with Ctrl/Cmd so cut still works).
+      // X: clear all pencil marks on this slide (ignore with Ctrl/Cmd so cut still works).
       if (!isTextField && e.code === "KeyX" && !e.ctrlKey && !e.metaKey) {
-        if (!currentUrl || !pencilEnabled) return;
+        if (!currentUrl) return;
         if (e.repeat) return;
+        if (!currentImageKeyRef.current) return;
         e.preventDefault();
         e.stopPropagation();
-        setPencilEnabled(false);
+        clearPencilDrawingForCurrentImage();
         return;
       }
 
@@ -5885,6 +5968,21 @@ export default function Page() {
         return;
       }
 
+      // Space: toggle timer run/pause (ignore with modifiers and while typing in text fields).
+      if (
+        !isTextField &&
+        (e.code === "Space" || e.key === " ") &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.altKey
+      ) {
+        if (e.repeat) return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (files.length && order.length) setIsRunning((v) => !v);
+        return;
+      }
+
       if (!files.length || !order.length) return;
 
       if (e.key === "ArrowLeft") {
@@ -5900,7 +5998,7 @@ export default function Page() {
     return () => {
       document.removeEventListener("keydown", handleKeyDown, true);
     };
-  }, [files.length, order.length, currentUrl, pencilEnabled, spawnNewOval, handleGlobalUndo, goToNextMarkedUpSlide]);
+  }, [files.length, order.length, currentUrl, spawnNewOval, handleGlobalUndo, goToNextMarkedUpSlide, clearPencilDrawingForCurrentImage]);
 
   // Cleanup object URL on unmount
   useEffect(() => {
@@ -5938,7 +6036,7 @@ export default function Page() {
           const markupData = getSlideDataForMarkupScore(currentFile.name);
           const markupScore = markupData != null ? perImageMarkupScore(markupData) : 0;
           return (
-            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
               <MetaRow label="File name" value={currentFile.name.split("/").pop() ?? currentFile.name} />
               <MetaRow label="Path" value={currentFile.name} />
               <MetaRow label="File size" value={imageMeta.fileSize != null ? formatBytes(imageMeta.fileSize) : "—"} />
@@ -5967,7 +6065,7 @@ export default function Page() {
         }
       case "grid":
         return (
-          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 12, opacity: 0.9 }}>
               <input type="checkbox" checked={!showGrid} onChange={(e) => setShowGrid(!e.target.checked)} />
               <span>Hide grid</span>
@@ -5985,7 +6083,7 @@ export default function Page() {
         );
       case "centerFrame":
         return (
-          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 12, opacity: 0.9 }}>
               <input type="checkbox" checked={!showCenterFrame} onChange={(e) => setShowCenterFrame(!e.target.checked)} />
               <span>Hide center frame</span>
@@ -6018,7 +6116,7 @@ export default function Page() {
             return !d.showOval && (d.extraOvals?.length ?? 0) === 0;
           });
         return (
-          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 12, opacity: 0.9 }}>
               <input
                 type="checkbox"
@@ -6174,7 +6272,7 @@ export default function Page() {
       }
       case "circle":
         return (
-          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 12, opacity: 0.9 }}>
               <input type="checkbox" checked={!showCircle} onChange={(e) => setShowCircle(!e.target.checked)} />
               <span>Hide head</span>
@@ -6185,7 +6283,7 @@ export default function Page() {
         );
       case "pose":
         return (
-          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 12, opacity: 0.9 }}>
               <input type="checkbox" checked={!showPose} onChange={(e) => setShowPose(!e.target.checked)} />
               <span>Hide pose</span>
@@ -6228,7 +6326,7 @@ export default function Page() {
         );
       case "rectangle":
         return (
-          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 12, opacity: 0.9 }}>
               <input type="checkbox" checked={!showRectangle} onChange={(e) => setShowRectangle(!e.target.checked)} />
               <span>Hide rectangle</span>
@@ -6255,7 +6353,7 @@ export default function Page() {
         );
       case "box3d":
         return (
-          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 12, opacity: 0.9 }}>
               <input type="checkbox" checked={!showBox3d} onChange={(e) => setShowBox3d(!e.target.checked)} />
               <span>Hide 3D box</span>
@@ -6301,7 +6399,7 @@ export default function Page() {
             (pencilStrokesByImageRef.current[currentImageKey]?.length ?? 0) > 0 ||
             pencilDraftRef.current != null);
         return (
-          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 12, opacity: 0.9 }}>
               <input type="checkbox" checked={pencilEnabled} onChange={(e) => setPencilEnabled(e.target.checked)} />
               <span>Enable pencil tool</span>
@@ -6373,9 +6471,7 @@ export default function Page() {
                 type="button"
                 onClick={() => {
                   if (!currentImageKey) return;
-                  pencilStrokesByImageRef.current[currentImageKey] = [];
-                  pencilDraftRef.current = null;
-                  setPencilNonce((n) => n + 1);
+                  clearPencilDrawingForCurrentImage();
                 }}
                 style={{ padding: "6px 10px", fontSize: 12, borderRadius: 6, border: "1px solid rgba(255,255,255,0.2)", background: "rgba(255,255,255,0.08)", color: "white", cursor: "pointer" }}
               >
@@ -6389,9 +6485,69 @@ export default function Page() {
           </div>
         );
       }
+      case "strokeCounter": {
+        void pencilNonce;
+        void undoStackVersion;
+        const key = currentImageKey;
+        const strokes = key ? (pencilStrokesByImageRef.current[key] ?? []) : [];
+        const draft = pencilDraftRef.current;
+        const n =
+          strokes.length && draft && strokes[strokes.length - 1] === draft
+            ? strokes.length - 1
+            : strokes.length;
+        return (
+          <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+            <div
+              aria-live="polite"
+              style={{
+                fontSize: 28,
+                fontWeight: 700,
+                lineHeight: 1.1,
+                fontVariantNumeric: "tabular-nums",
+                letterSpacing: "-0.02em",
+              }}
+            >
+              {n}
+            </div>
+            <p style={{ margin: 0, fontSize: 11, lineHeight: 1.35, opacity: 0.78 }}>
+              Strokes on this slide{key ? ` (${currentFile?.name.split("/").pop() ?? key})` : ""}. Updates when you finish a stroke, undo, clear, or change slide.
+            </p>
+            <label style={{ display: "flex", flexDirection: "column", gap: 3, fontSize: 11, opacity: 0.9 }}>
+              <span>Advance after N strokes (0 = off). One stroke past N clears all marks on this slide.</span>
+              <input
+                type="number"
+                inputMode="numeric"
+                min={0}
+                max={999}
+                step={1}
+                value={strokeAdvanceTarget}
+                onChange={(e) => {
+                  const v = Math.floor(Number(e.target.value));
+                  if (!Number.isFinite(v)) return;
+                  setStrokeAdvanceTarget(Math.min(999, Math.max(0, v)));
+                }}
+                style={{
+                  width: "100%",
+                  maxWidth: 120,
+                  padding: "4px 8px",
+                  borderRadius: 4,
+                  border: "1px solid rgba(255,255,255,0.2)",
+                  background: "rgba(0,0,0,0.25)",
+                  color: "white",
+                  fontSize: 12,
+                  fontVariantNumeric: "tabular-nums",
+                }}
+              />
+            </label>
+            <p style={{ margin: 0, fontSize: 10, lineHeight: 1.35, opacity: 0.65 }}>
+              When you finish a stroke (lift the pointer) and the count reaches exactly N, the deck advances to the next image after that line is drawn — not while the stroke is still in progress.
+            </p>
+          </div>
+        );
+      }
       case "adjustImage":
         return (
-          <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             <SliderRow label="Scale" value={imageScale} min={0.25} max={3} step={0.05} format={(v) => `${Math.round(v * 100)}%`} onChange={setImageScale} />
             <SliderRow label="Brightness" value={imageBrightness} min={0} max={2} step={0.05} format={(v) => `${Math.round(v * 100)}%`} onChange={setImageBrightness} />
             <SliderRow label="Contrast" value={imageContrast} min={0} max={3} step={0.05} format={(v) => `${Math.round(v * 100)}%`} onChange={setImageContrast} />
@@ -6488,6 +6644,7 @@ export default function Page() {
       case "rectangle": return rectangleExpanded;
       case "box3d": return box3dExpanded;
       case "pencil": return pencilExpanded;
+      case "strokeCounter": return strokeCounterExpanded;
       case "adjustImage": return adjustImageExpanded;
       default: return true;
     }
@@ -6504,6 +6661,7 @@ export default function Page() {
       case "rectangle": setRectangleExpanded(next); break;
       case "box3d": setBox3dExpanded(next); break;
       case "pencil": setPencilExpanded(next); break;
+      case "strokeCounter": setStrokeCounterExpanded(next); break;
       case "adjustImage": setAdjustImageExpanded(next); break;
     }
   }
@@ -6512,10 +6670,10 @@ export default function Page() {
     const tabBtn = (active: boolean) =>
       ({
         flex: 1,
-        padding: "8px 10px",
-        fontSize: 12,
+        padding: "4px 8px",
+        fontSize: 11,
         fontWeight: 600,
-        borderRadius: 8,
+        borderRadius: 6,
         border: "1px solid rgba(255,255,255,0.2)",
         cursor: "pointer",
         background: active ? "rgba(255,255,255,0.14)" : "rgba(255,255,255,0.05)",
@@ -6526,7 +6684,7 @@ export default function Page() {
       <div
         role="tablist"
         aria-label="Sidebar panels"
-        style={{ display: "flex", gap: 8, flexShrink: 0, borderBottom: "1px solid rgba(255,255,255,0.12)", paddingBottom: 12 }}
+        style={{ display: "flex", gap: 4, flexShrink: 0, borderBottom: "1px solid rgba(255,255,255,0.12)", paddingBottom: 5 }}
       >
         <button
           type="button"
@@ -6577,7 +6735,7 @@ export default function Page() {
           return (
             <div
               key={sectionId}
-              style={index === 0 ? undefined : { marginTop: 16, paddingTop: 16, borderTop: "1px solid rgba(255,255,255,0.1)" }}
+              style={index === 0 ? undefined : { marginTop: 6, paddingTop: 6, borderTop: "1px solid rgba(255,255,255,0.1)" }}
               onDragOver={(e) => {
                 e.preventDefault();
                 e.dataTransfer.dropEffect = "move";
@@ -6607,7 +6765,7 @@ export default function Page() {
                   <button
                     type="button"
                     onClick={() => setExpanded(sectionId, !expanded)}
-                    style={{ display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%", padding: "6px 0", marginBottom: expanded ? 8 : 0, border: "none", background: "transparent", color: "white", font: "inherit", fontWeight: 600, opacity: 0.95, cursor: "pointer", textAlign: "left" }}
+                    style={{ display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%", padding: "4px 0", marginBottom: expanded ? 4 : 0, border: "none", background: "transparent", color: "white", font: "inherit", fontWeight: 600, opacity: 0.95, cursor: "pointer", textAlign: "left" }}
                   >
                     <span>{SIDEBAR_SECTION_LABEL[sectionId]}</span>
                     <span aria-hidden style={{ opacity: 0.7, fontSize: 11, marginLeft: 8 }}>{expanded ? "▼" : "▶"}</span>
@@ -6675,7 +6833,7 @@ export default function Page() {
               cursor: "pointer",
               display: "flex",
               alignItems: "center",
-              gap: 12,
+              gap: 6,
             }}
           >
             <img src="/logo.png" alt="" style={{ height: 32, width: "auto", display: "block", filter: "brightness(0) invert(1)" }} />
@@ -6712,7 +6870,7 @@ export default function Page() {
           <div
             style={{
               display: "flex",
-              gap: 12,
+              gap: 6,
               flexWrap: "wrap",
               justifyContent: "center",
               alignItems: "center",
@@ -6819,10 +6977,10 @@ export default function Page() {
         >
           <div
             style={{
-              padding: currentUrl ? "20px 20px 0" : "0 0 20px",
+              padding: currentUrl ? "6px 8px 0" : "0 0 20px",
               display: "flex",
               alignItems: "baseline",
-              gap: 12,
+              gap: 6,
               opacity: showOverlays ? 1 : 0,
               pointerEvents: !showOverlays ? "none" : topHudPencilPassthrough ? "none" : "auto",
               transition: "opacity 0.3s ease",
@@ -6837,30 +6995,30 @@ export default function Page() {
               onClick={goToLanding}
               style={{
                 margin: 0,
-                fontSize: 18,
+                fontSize: 15,
                 fontWeight: 500,
                 opacity: 0.9,
                 cursor: "pointer",
                 display: "flex",
                 alignItems: "center",
-                gap: 8,
+                gap: 6,
                 pointerEvents: showOverlays ? "auto" : "none",
               }}
             >
-              <img src="/logo.png" alt="" style={{ height: 18, width: "auto", display: "block", filter: "brightness(0) invert(1)" }} />
-              Gesture Trainer <span style={{ fontSize: 14, opacity: 0.6, fontWeight: 400 }}>β {APP_VERSION}</span>
+              <img src="/logo.png" alt="" style={{ height: 15, width: "auto", display: "block", filter: "brightness(0) invert(1)" }} />
+              Gesture Trainer <span style={{ fontSize: 12, opacity: 0.6, fontWeight: 400 }}>β {APP_VERSION}</span>
             </h1>
           </div>
 
           <div
             style={{
               display: "flex",
-              gap: 8,
+              gap: 4,
               flexWrap: "wrap",
               alignItems: "center",
               justifyContent: currentUrl ? "flex-end" : "flex-start",
               marginBottom: currentUrl ? 0 : 20,
-              padding: currentUrl ? "20px 20px 0 0" : 0,
+              padding: currentUrl ? "6px 8px 0 0" : 0,
               opacity: showOverlays ? 1 : 0,
               pointerEvents: !showOverlays ? "none" : topHudPencilPassthrough ? "none" : "auto",
               transition: "opacity 0.3s ease",
@@ -6941,7 +7099,7 @@ export default function Page() {
               style={{
                 marginLeft: "auto",
                 opacity: 0.7,
-                fontSize: 13,
+                fontSize: 12,
                 pointerEvents: topHudPencilPassthrough ? "none" : showOverlays ? "auto" : "none",
               }}
             >
@@ -6975,15 +7133,15 @@ export default function Page() {
                 style={{
                   position: "absolute",
                   left: 0,
-                  top: 52,
+                  top: 38,
                   bottom: 0,
-                  width: 280,
-                  padding: "20px 16px",
+                  width: 220,
+                  padding: "6px 8px",
                   background: "transparent",
                   zIndex: 5,
                   overflow: "hidden",
-                  fontSize: 13,
-                  lineHeight: 1.5,
+                  fontSize: 12,
+                  lineHeight: 1.35,
                   display: "flex",
                   flexDirection: "column",
                   opacity: showOverlays ? 1 : 0,
@@ -6998,7 +7156,7 @@ export default function Page() {
                     overflow: "auto",
                     display: "flex",
                     flexDirection: "column",
-                    gap: 16,
+                    gap: 6,
                     width: "fit-content",
                     maxWidth: "100%",
                     alignSelf: "flex-start",
@@ -7015,15 +7173,15 @@ export default function Page() {
                 style={{
                   position: "absolute",
                   right: 0,
-                  top: 52,
+                  top: 38,
                   bottom: 0,
-                  width: 280,
-                  padding: "20px 16px",
+                  width: 220,
+                  padding: "6px 8px",
                   background: "transparent",
                   zIndex: 5,
                   overflow: "hidden",
-                  fontSize: 13,
-                  lineHeight: 1.5,
+                  fontSize: 12,
+                  lineHeight: 1.35,
                   display: "flex",
                   flexDirection: "column",
                   opacity: showOverlays ? 1 : 0,
@@ -7038,7 +7196,7 @@ export default function Page() {
                     overflow: "auto",
                     display: "flex",
                     flexDirection: "column",
-                    gap: 16,
+                    gap: 6,
                     width: "fit-content",
                     maxWidth: "100%",
                     alignSelf: "flex-end",
@@ -7082,9 +7240,7 @@ export default function Page() {
                   transformOrigin: "center center",
                   cursor: isPanning
                     ? "grabbing"
-                    : spacePanActive
-                      ? "grab"
-                      : pencilEnabled
+                    : pencilEnabled
                         ? pencilMoveAllMode
                           ? "grab"
                           : PENCIL_TOOL_CURSOR
@@ -7191,33 +7347,6 @@ export default function Page() {
                 />
               </div>
             </div>
-            {currentUrl && spacePanActive ? (
-              <div
-                aria-hidden
-                style={{
-                  position: "absolute",
-                  left: 280,
-                  right: 280,
-                  top: 52,
-                  bottom: 0,
-                  zIndex: 25,
-                  cursor: isPanning ? "grabbing" : "grab",
-                  touchAction: "none",
-                }}
-                onMouseDown={(e) => {
-                  if (e.button !== 0) return;
-                  e.preventDefault();
-                  e.stopPropagation();
-                  setIsPanning(true);
-                  panStartRef.current = {
-                    startX: e.clientX,
-                    startY: e.clientY,
-                    startPanX: panX,
-                    startPanY: panY,
-                  };
-                }}
-              />
-            ) : null}
             {currentUrl && showGrid && (
               <div
                 aria-hidden
@@ -8346,15 +8475,15 @@ export default function Page() {
 
 function btn(disabled = false): React.CSSProperties {
   return {
-    padding: "6px 12px",
-    borderRadius: 6,
+    padding: "4px 8px",
+    borderRadius: 4,
     border: "1px solid rgba(255,255,255,0.12)",
     background: disabled ? "rgba(255,255,255,0.04)" : "rgba(255,255,255,0.08)",
     color: "white",
     cursor: disabled ? "not-allowed" : "pointer",
     opacity: disabled ? 0.5 : 0.9,
     fontWeight: 500,
-    fontSize: 13,
+    fontSize: 12,
     transition: "opacity 0.2s",
   };
 }
