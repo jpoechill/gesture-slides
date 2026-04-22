@@ -1,6 +1,17 @@
-export const APP_VERSION = "0.6.0";
+export const APP_VERSION = "0.6.1";
 
 export const VERSION_HISTORY: { version: string; date: string; changes: string[] }[] = [
+  {
+    version: "0.6.1",
+    date: "2026-04-21",
+    changes: [
+      "Pencil rendering/sanitization hardened: UV stroke sizing is safer across legacy data and malformed points are filtered before draw",
+      "Stroke counter section added to the sidebar, with per-slide count and optional auto-advance after N completed strokes (0 = off)",
+      "When the stroke target is exceeded by one, current-slide pencil marks are cleared; clear behavior is unified for keyboard X and sidebar action",
+      "Space now toggles timer run/pause; prior hold-Space pan overlay was removed",
+      "HUD and sidebar spacing, sizing, and typography were tightened for a denser layout",
+    ],
+  },
   {
     version: "0.6.0",
     date: "2026-04-05",
