@@ -1,5 +1,6 @@
 export const SIDEBAR_SECTION_IDS = [
   "imageInfo",
+  "imagePlacement",
   "grid",
   "centerFrame",
   "oval",
@@ -19,6 +20,7 @@ export const SIDEBAR_DND_COLUMN = "application/x-gesture-slideshow-sidebar-colum
 
 export const DEFAULT_SIDEBAR_LEFT: SidebarSectionId[] = [
   "imageInfo",
+  "imagePlacement",
   "oval",
   "grid",
   "centerFrame",
@@ -46,6 +48,7 @@ export function sidebarOrderForTab(tab: "main" | "archive", order: SidebarSectio
 
 export const SIDEBAR_SECTION_LABEL: Record<SidebarSectionId, string> = {
   imageInfo: "Image info",
+  imagePlacement: "Image placement",
   grid: "Grid",
   centerFrame: "Center frame",
   oval: "Oval",

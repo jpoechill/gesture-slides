@@ -32,6 +32,8 @@ export const DEFAULT_SETTINGS = {
   imageGrayscale: 0,
   imageSaturation: 1,
   imageBlur: 0,
+  imagePlacementEnabled: false,
+  imagePlacement: "center" as "left" | "center" | "right",
   pencilEnabled: false,
   pencilSize: 4,
   pencilColor: "#ff3b30",
@@ -39,6 +41,8 @@ export const DEFAULT_SETTINGS = {
   pencilCurveSensitivity: 65,
   /** 0 = off. When a finished pencil stroke brings the current slide's stroke count to exactly this number, advance to the next image. */
   strokeAdvanceTarget: 0,
+  /** If true, clear this slide's pencil marks right before auto-advancing on stroke target. */
+  strokeAdvanceDeleteMarks: false,
   showCenterFrame: false,
   showGrid: false,
   gridCellSize: 48,

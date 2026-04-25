@@ -76,9 +76,8 @@ import {
   migrateLegacyPencilStrokesToUv,
   pencilStrokeToDisplayPixels,
   perImageMarkupScore,
-  readPerImageAggregateFromDirectory,
   resetNonPencilSlidesToBare,
-  writePerImageAggregateToDirectory,
+  type ParsedPerImageAggregate,
   type PencilPoint,
   type PencilStroke,
   type PerImageSlideData,
@@ -93,6 +92,7 @@ import {
 
 type FileHandleEntry = {
   name: string;
+  key: string;
   handle: FileSystemFileHandle;
 };
 
@@ -103,7 +103,7 @@ function hudNeighborWindow(
   files: FileHandleEntry[],
   order: number[],
   idxInOrder: number,
-  currentName: string | undefined,
+  currentKey: string | undefined,
 ): Record<HudNeighborKey, FileHandleEntry | null> {
   const empty: Record<HudNeighborKey, FileHandleEntry | null> = {
     p0: null,
@@ -119,13 +119,120 @@ function hudNeighborWindow(
   };
   let p0: FileHandleEntry | null = at(-2);
   let p1: FileHandleEntry | null = at(-1);
-  if (p0 && currentName && p0.name === currentName) p0 = null;
-  if (p1 && p0 && p1.name === p0.name) p0 = null;
+  if (p0 && currentKey && p0.key === currentKey) p0 = null;
+  if (p1 && p0 && p1.key === p0.key) p0 = null;
   let n0: FileHandleEntry | null = at(1);
   let n1: FileHandleEntry | null = at(2);
-  if (n1 && currentName && n1.name === currentName) n1 = null;
-  if (n0 && n1 && n0.name === n1.name) n1 = null;
+  if (n1 && currentKey && n1.key === currentKey) n1 = null;
+  if (n0 && n1 && n0.key === n1.key) n1 = null;
   return { p0, p1, n0, n1 };
+}
+
+async function computeFileContentHash(handle: FileSystemFileHandle): Promise<string> {
+  const file = await handle.getFile();
+  const buf = await file.arrayBuffer();
+  const digest = await crypto.subtle.digest("SHA-256", buf);
+  const bytes = new Uint8Array(digest);
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  return `sha256:${hex}`;
+}
+
+function pickRicherSlideData(a: PerImageSlideData, b: PerImageSlideData): PerImageSlideData {
+  return perImageMarkupScore(b) > perImageMarkupScore(a) ? b : a;
+}
+
+function orderWithoutAdjacentDuplicateHashes(files: FileHandleEntry[], order: number[]): number[] {
+  if (order.length < 2) return order;
+  const buckets = new Map<string, number[]>();
+  for (const idx of order) {
+    const key = files[idx]?.key ?? `idx:${idx}`;
+    const arr = buckets.get(key);
+    if (arr) arr.push(idx);
+    else buckets.set(key, [idx]);
+  }
+  const out: number[] = [];
+  let prevKey = "";
+  while (out.length < order.length) {
+    let pickKey: string | null = null;
+    let pickCount = -1;
+    for (const [k, arr] of buckets) {
+      const n = arr.length;
+      if (n <= 0 || k === prevKey) continue;
+      if (n > pickCount) {
+        pickCount = n;
+        pickKey = k;
+      }
+    }
+    if (!pickKey) {
+      for (const [k, arr] of buckets) {
+        const n = arr.length;
+        if (n <= 0) continue;
+        if (n > pickCount) {
+          pickCount = n;
+          pickKey = k;
+        }
+      }
+    }
+    if (!pickKey) break;
+    const q = buckets.get(pickKey)!;
+    const idx = q.shift();
+    if (idx === undefined) break;
+    out.push(idx);
+    prevKey = pickKey;
+  }
+  if (out.length > 2) {
+    const firstKey = files[out[0] ?? -1]?.key ?? "";
+    const lastKey = files[out[out.length - 1] ?? -1]?.key ?? "";
+    if (firstKey && firstKey === lastKey) {
+      for (let i = out.length - 2; i >= 1; i--) {
+        const candidateKey = files[out[i] ?? -1]?.key ?? "";
+        const beforeCandidateKey = files[out[i - 1] ?? -1]?.key ?? "";
+        if (!candidateKey || candidateKey === firstKey || beforeCandidateKey === firstKey) continue;
+        const tail = out[out.length - 1]!;
+        out[out.length - 1] = out[i]!;
+        out[i] = tail;
+        break;
+      }
+    }
+  }
+  return out.length === order.length ? out : order;
+}
+
+async function readPerImageAggregateFromAppStorage(): Promise<ParsedPerImageAggregate> {
+  try {
+    const res = await fetch("/api/annotations", { cache: "no-store" });
+    if (!res.ok) {
+      console.warn("gesture-slideshow: reading local aggregate failed", res.status);
+      return { images: {}, bareNonPencilMigrationVersion: PER_IMAGE_BARE_NON_PENCIL_VERSION };
+    }
+    const data = (await res.json()) as ParsedPerImageAggregate;
+    return {
+      images: data?.images ?? {},
+      bareNonPencilMigrationVersion:
+        typeof data?.bareNonPencilMigrationVersion === "number"
+          ? data.bareNonPencilMigrationVersion
+          : PER_IMAGE_BARE_NON_PENCIL_VERSION,
+    };
+  } catch (err) {
+    console.warn("gesture-slideshow: reading local aggregate failed", err);
+    return { images: {}, bareNonPencilMigrationVersion: PER_IMAGE_BARE_NON_PENCIL_VERSION };
+  }
+}
+
+async function writePerImageAggregateToAppStorage(
+  images: Record<string, PerImageSlideData>,
+  opts?: { bareNonPencilMigrationVersion?: number }
+): Promise<void> {
+  const bareNonPencilMigrationVersion =
+    opts?.bareNonPencilMigrationVersion ?? PER_IMAGE_BARE_NON_PENCIL_VERSION;
+  const res = await fetch("/api/annotations", {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ images, bareNonPencilMigrationVersion }),
+  });
+  if (!res.ok) {
+    throw new Error(`writing local aggregate failed (${res.status})`);
+  }
 }
 
 function revokeSlidePrefetchMap(m: Map<string, string>) {
@@ -1190,8 +1297,6 @@ function resolveBox3dSvgPointerCursor(
 
 export default function Page() {
   const [dirHandle, setDirHandle] = useState<FileSystemDirectoryHandle | null>(null);
-  const dirHandleRef = useRef<FileSystemDirectoryHandle | null>(null);
-  dirHandleRef.current = dirHandle;
   /** Mirrors `bareNonPencilMigrationVersion` in `.gesture-slideshow-slides.json` for writes after load. */
   const bareNonPencilMigrationVersionRef = useRef(PER_IMAGE_BARE_NON_PENCIL_VERSION);
   /** Last mouse position over the slide stage (client coords). Used to spawn shapes at cursor. */
@@ -1242,7 +1347,8 @@ export default function Page() {
   /** Assigned each render after overlay snapshot + flush exist (see below). */
   const pushUndoSnapshotRef = useRef<() => void>(() => {});
   const overlaySnapshotRef = useRef<PerImageSlideData | null>(null);
-  const prevImageKeyForAggregateRef = useRef<string>("");
+  const prevSlideIdentityForAggregateRef = useRef<string>("");
+  const prevImageStorageKeyForAggregateRef = useRef<string>("");
   const currentImageKeyRef = useRef<string>("");
   const perImageAggregateFlushTimerRef = useRef<number | null>(null);
   const poseLandmarkerRef = useRef<PoseLandmarker | null>(null);
@@ -1270,6 +1376,14 @@ export default function Page() {
   const [supported, setSupported] = useState(false);
   const [lastFolderName, setLastFolderNameState] = useState("");
   const [lastFolderOpenedAt, setLastFolderOpenedAtState] = useState<number | null>(null);
+  const [isFolderLoading, setIsFolderLoading] = useState(false);
+  const [folderLoadStatus, setFolderLoadStatus] = useState("Waiting…");
+  const folderLoadProgressRef = useRef({ hashed: 0, lastUiAt: 0 });
+  const [pencilCanvasVisible, setPencilCanvasVisible] = useState(false);
+  const pencilCanvasVisibleRef = useRef(false);
+  const [loadedImageUrl, setLoadedImageUrl] = useState<string | null>(null);
+  const [currentUrlSlideIdentity, setCurrentUrlSlideIdentity] = useState<string | null>(null);
+  const [loadedSlideIdentity, setLoadedSlideIdentity] = useState<string | null>(null);
 
   type ImageMeta = {
     fileSize?: number;
@@ -1288,6 +1402,13 @@ export default function Page() {
   const [imageGrayscale, setImageGrayscale] = useState(storedSettings.imageGrayscale);
   const [imageSaturation, setImageSaturation] = useState(storedSettings.imageSaturation);
   const [imageBlur, setImageBlur] = useState(storedSettings.imageBlur);
+  const [imagePlacementEnabled, setImagePlacementEnabled] = useState(
+    storedSettings.imagePlacementEnabled === true
+  );
+  const [imagePlacement, setImagePlacement] = useState<"left" | "center" | "right">(() => {
+    const v = storedSettings.imagePlacement;
+    return v === "left" || v === "right" || v === "center" ? v : "center";
+  });
   const [pencilEnabled, setPencilEnabled] = useState(storedSettings.pencilEnabled === true);
   const [pencilSize, setPencilSize] = useState(
     Math.min(24, Math.max(1, Number(storedSettings.pencilSize) || 4))
@@ -1303,6 +1424,9 @@ export default function Page() {
     const t = Math.floor(Number(storedSettings.strokeAdvanceTarget));
     return Number.isFinite(t) ? Math.min(999, Math.max(0, t)) : DEFAULT_SETTINGS.strokeAdvanceTarget;
   });
+  const [strokeAdvanceDeleteMarks, setStrokeAdvanceDeleteMarks] = useState(
+    storedSettings.strokeAdvanceDeleteMarks === true
+  );
   const strokeAdvanceTargetRef = useRef(strokeAdvanceTarget);
   strokeAdvanceTargetRef.current = strokeAdvanceTarget;
   const [pencilNonce, setPencilNonce] = useState(0);
@@ -3982,6 +4106,13 @@ export default function Page() {
       `translate(${panX}px, ${panY}px) scale(${imageScale}) rotate(${imageRotate}deg)`,
     [panX, panY, imageScale, imageRotate]
   );
+  const imagePlacementJustify = !imagePlacementEnabled
+    ? "center"
+    : imagePlacement === "left"
+      ? "flex-start"
+      : imagePlacement === "right"
+        ? "flex-end"
+        : "center";
   const [isPanning, setIsPanning] = useState(false);
   /** When oval is selected, show rotate cursor over the image outside the oval widget. */
   const [deckCursorMode, setDeckCursorMode] = useState<"grab" | "rotate">("grab");
@@ -4003,6 +4134,7 @@ export default function Page() {
   /** Hides only the raster slide; pencil, pose, and vector overlays stay. */
   const [mainImageHidden, setMainImageHidden] = useState(false);
   const [imageInfoExpanded, setImageInfoExpanded] = useState(false);
+  const [imagePlacementExpanded, setImagePlacementExpanded] = useState(false);
   const [sidebarPanelTab, setSidebarPanelTab] = useState<"main" | "archive">("main");
   const [gridExpanded, setGridExpanded] = useState(false);
   const [centerFrameExpanded, setCenterFrameExpanded] = useState(false);
@@ -4185,6 +4317,12 @@ export default function Page() {
     setImageGrayscale(s.imageGrayscale);
     setImageSaturation(s.imageSaturation);
     setImageBlur(s.imageBlur);
+    setImagePlacementEnabled(s.imagePlacementEnabled === true);
+    setImagePlacement(
+      s.imagePlacement === "left" || s.imagePlacement === "right" || s.imagePlacement === "center"
+        ? s.imagePlacement
+        : "center"
+    );
     setPencilEnabled(s.pencilEnabled === true);
     setPencilSize(Math.min(24, Math.max(1, Number(s.pencilSize) || 4)));
     setPencilColor(typeof s.pencilColor === "string" && s.pencilColor ? s.pencilColor : "#ff3b30");
@@ -4200,6 +4338,7 @@ export default function Page() {
         Number.isFinite(t) ? Math.min(999, Math.max(0, t)) : DEFAULT_SETTINGS.strokeAdvanceTarget
       );
     }
+    setStrokeAdvanceDeleteMarks(s.strokeAdvanceDeleteMarks === true);
     setShowCenterFrame(s.showCenterFrame !== false);
     setShowGrid(s.showGrid !== false);
     setGridCellSize(Math.min(200, Math.max(16, Number(s.gridCellSize) || 48)));
@@ -4291,11 +4430,14 @@ export default function Page() {
       imageGrayscale,
       imageSaturation,
       imageBlur,
+      imagePlacementEnabled,
+      imagePlacement,
       pencilEnabled,
       pencilSize,
       pencilColor,
       pencilCurveSensitivity,
       strokeAdvanceTarget,
+      strokeAdvanceDeleteMarks,
       showCenterFrame,
       showGrid,
       gridCellSize,
@@ -4353,13 +4495,16 @@ export default function Page() {
     imageGrayscale,
     imageSaturation,
     imageBlur,
+    imagePlacementEnabled,
+    imagePlacement,
     pencilEnabled,
     pencilSize,
     pencilColor,
-      pencilCurveSensitivity,
-      strokeAdvanceTarget,
-      showCenterFrame,
-      showGrid,
+    pencilCurveSensitivity,
+    strokeAdvanceTarget,
+    strokeAdvanceDeleteMarks,
+    showCenterFrame,
+    showGrid,
     gridCellSize,
     centerFrameSize,
     centerFrameLabelSize,
@@ -4422,8 +4567,8 @@ export default function Page() {
   }, [currentFile?.name]);
 
   const hudNeighborFiles = useMemo(
-    () => hudNeighborWindow(files, order, idxInOrder, currentFile?.name),
-    [files, order, idxInOrder, currentFile?.name],
+    () => hudNeighborWindow(files, order, idxInOrder, currentFile?.key),
+    [files, order, idxInOrder, currentFile?.key],
   );
 
   const goToHudNeighborFile = useCallback(
@@ -4584,8 +4729,29 @@ export default function Page() {
     [pencilNonce, undoStackVersion],
   );
 
-  const currentImageKey = currentFile?.name ?? "";
+  const currentImageKey = currentFile?.key ?? "";
+  const currentSlideIdentity = currentFile?.name ?? "";
   currentImageKeyRef.current = currentImageKey;
+
+  const setPencilVisibility = useCallback((next: boolean) => {
+    if (pencilCanvasVisibleRef.current === next) return;
+    pencilCanvasVisibleRef.current = next;
+    if (!next) {
+      const canvas = pencilCanvasRef.current;
+      const ctx = canvas?.getContext("2d");
+      if (canvas && ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
+    setPencilCanvasVisible(next);
+  }, []);
+
+  useEffect(() => {
+    setPencilVisibility(false);
+  }, [currentSlideIdentity, currentUrl, setPencilVisibility]);
+
+  useEffect(() => {
+    setLoadedImageUrl(null);
+    setLoadedSlideIdentity(null);
+  }, [currentUrl]);
 
   useEffect(() => {
     return () => {
@@ -4594,7 +4760,7 @@ export default function Page() {
         strokeAdvanceTimeoutRef.current = null;
       }
     };
-  }, [currentImageKey, strokeAdvanceTarget]);
+  }, [currentSlideIdentity, strokeAdvanceTarget]);
 
   const clearPencilDrawingForCurrentImage = useCallback(() => {
     const key = currentImageKeyRef.current;
@@ -4677,8 +4843,6 @@ export default function Page() {
   }, []);
 
   const flushPerImageAggregateToDisk = useCallback(() => {
-    const dir = dirHandleRef.current;
-    if (!dir) return;
     const pencilOnly: Record<string, PerImageSlideData> = {};
     for (const [key, d] of Object.entries(perImageSlideDataRef.current)) {
       if (!d) continue;
@@ -4690,7 +4854,7 @@ export default function Page() {
         pencilStrokes: structuredClone(d.pencilStrokes ?? []),
       };
     }
-    writePerImageAggregateToDirectory(dir, pencilOnly, {
+    writePerImageAggregateToAppStorage(pencilOnly, {
       bareNonPencilMigrationVersion: bareNonPencilMigrationVersionRef.current,
     }).catch((err) => console.warn("gesture-slideshow: writing per-image aggregate failed", err));
   }, []);
@@ -4728,32 +4892,26 @@ export default function Page() {
   };
 
   useEffect(() => {
-    const prev = prevImageKeyForAggregateRef.current;
-    if (prev && prev !== currentImageKey && overlaySnapshotRef.current) {
+    const prevSlideIdentity = prevSlideIdentityForAggregateRef.current;
+    const prevStorageKey = prevImageStorageKeyForAggregateRef.current;
+    if (prevSlideIdentity && prevSlideIdentity !== currentSlideIdentity && prevStorageKey && overlaySnapshotRef.current) {
       const snap: PerImageSlideData = {
         ...overlaySnapshotRef.current,
-        pencilStrokesUv: perImageSlideDataRef.current[prev]?.pencilStrokesUv ?? true,
-        pencilStrokes: structuredClone(pencilStrokesByImageRef.current[prev] ?? []),
+        pencilStrokesUv: perImageSlideDataRef.current[prevStorageKey]?.pencilStrokesUv ?? true,
+        pencilStrokes: structuredClone(pencilStrokesByImageRef.current[prevStorageKey] ?? []),
       };
-      perImageSlideDataRef.current = { ...perImageSlideDataRef.current, [prev]: snap };
+      perImageSlideDataRef.current = { ...perImageSlideDataRef.current, [prevStorageKey]: snap };
       schedulePerImageAggregateFlush();
     }
-    prevImageKeyForAggregateRef.current = currentImageKey;
+    prevSlideIdentityForAggregateRef.current = currentSlideIdentity;
+    prevImageStorageKeyForAggregateRef.current = currentImageKey;
 
     if (!currentImageKey) return;
 
     const saved = perImageSlideDataRef.current[currentImageKey];
     if (saved) {
       applyPerImageSlideData(saved);
-      const savedStrokes = structuredClone(saved.pencilStrokes ?? []);
-      const target = strokeAdvanceTargetRef.current;
-      if (target > 0 && savedStrokes.length >= target) {
-        saved.pencilStrokes = [];
-        pencilStrokesByImageRef.current[currentImageKey] = [];
-        schedulePerImageAggregateFlush();
-      } else {
-        pencilStrokesByImageRef.current[currentImageKey] = savedStrokes;
-      }
+      pencilStrokesByImageRef.current[currentImageKey] = structuredClone(saved.pencilStrokes ?? []);
       setPencilNonce((n) => n + 1);
     } else {
       // Ensure overlays/shapes are unique per image (no bleed from the previous slide).
@@ -4762,7 +4920,7 @@ export default function Page() {
       pencilStrokesByImageRef.current[currentImageKey] = [];
       setPencilNonce((n) => n + 1);
     }
-  }, [currentImageKey, applyPerImageSlideData, schedulePerImageAggregateFlush]);
+  }, [currentSlideIdentity, currentImageKey, applyPerImageSlideData, schedulePerImageAggregateFlush]);
 
   useLayoutEffect(() => {
     const snap: PerImageSlideData = {
@@ -4925,6 +5083,12 @@ export default function Page() {
     ctx.translate(oxoy.ox, oxoy.oy);
     const cw = img?.clientWidth ?? 0;
     const ch = img?.clientHeight ?? 0;
+    const imageReady = !!(img && img.complete && img.naturalWidth && img.naturalHeight && cw > 0 && ch > 0);
+    if (!imageReady) {
+      setPencilVisibility(false);
+      ctx.restore();
+      return;
+    }
     const slideUv = perImageSlideDataRef.current[currentImageKey]?.pencilStrokesUv ?? true;
     const strokes = pencilStrokesByImageRef.current[currentImageKey] ?? [];
     const draft = pencilDraftRef.current;
@@ -4936,7 +5100,11 @@ export default function Page() {
       // slideUv but image not laid out yet: skip (raw UV would draw as ~0–1 px at top-left).
     }
     ctx.restore();
-  }, [currentImageKey]);
+    setPencilVisibility(true);
+  }, [
+    currentImageKey,
+    setPencilVisibility,
+  ]);
 
   useEffect(() => {
     redrawPencilCanvas();
@@ -5152,14 +5320,13 @@ export default function Page() {
         const rk = currentImageKeyRef.current;
         if (rk) {
           const nStrokes = pencilStrokesByImageRef.current[rk]?.length ?? 0;
-          if (nStrokes > strokeAdvanceTarget) {
-            clearPencilDrawingForCurrentImage();
-          } else if (nStrokes === strokeAdvanceTarget) {
+          if (nStrokes === strokeAdvanceTarget) {
             const len = Math.max(1, order.length);
             if (strokeAdvanceTimeoutRef.current) {
               clearTimeout(strokeAdvanceTimeoutRef.current);
               strokeAdvanceTimeoutRef.current = null;
             }
+            if (strokeAdvanceDeleteMarks) clearPencilDrawingForCurrentImage();
             // Let the finalized stroke paint, then advance immediately.
             requestAnimationFrame(() => {
               requestAnimationFrame(() => {
@@ -5181,6 +5348,7 @@ export default function Page() {
     pencilSize,
     pencilCurveSensitivity,
     strokeAdvanceTarget,
+    strokeAdvanceDeleteMarks,
     order,
     redrawPencilCanvas,
     clearPencilDrawingForCurrentImage,
@@ -5233,7 +5401,20 @@ export default function Page() {
     // @ts-expect-error: values() exists on FileSystemDirectoryHandle but types may be incomplete
     for await (const entry of dir.values()) {
       if (entry.kind === "file" && isImageFileName(entry.name)) {
-        collected.push({ name: pathPrefix ? `${pathPrefix}/${entry.name}` : entry.name, handle: entry });
+        const name = pathPrefix ? `${pathPrefix}/${entry.name}` : entry.name;
+        let key = name;
+        try {
+          key = await computeFileContentHash(entry);
+        } catch (err) {
+          console.warn("gesture-slideshow: failed to hash image, falling back to path key", name, err);
+        }
+        folderLoadProgressRef.current.hashed += 1;
+        const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+        if (now - folderLoadProgressRef.current.lastUiAt > 120) {
+          folderLoadProgressRef.current.lastUiAt = now;
+          setFolderLoadStatus(`Scanning + hashing images… ${folderLoadProgressRef.current.hashed}`);
+        }
+        collected.push({ name, key, handle: entry });
       } else if (entry.kind === "directory" && !IGNORED_DIRS.has(entry.name)) {
         const subPath = pathPrefix ? `${pathPrefix}/${entry.name}` : entry.name;
         const subFiles = await collectImagesRecursive(entry, subPath);
@@ -5244,49 +5425,77 @@ export default function Page() {
   }
 
   async function applyFolder(handle: FileSystemDirectoryHandle) {
-    revokeSlidePrefetchMap(slidePrefetchRef.current);
-    setDirHandle(handle);
-    const collected = await collectImagesRecursive(handle, "");
-    if (!collected.length) {
-      alert("No images found in that folder. Try a folder with .jpg/.png/.webp etc.");
-      setFiles([]);
-      setOrder([]);
+    setIsFolderLoading(true);
+    setFolderLoadStatus(`Loading folder “${handle.name}”…`);
+    folderLoadProgressRef.current = { hashed: 0, lastUiAt: 0 };
+    try {
+      revokeSlidePrefetchMap(slidePrefetchRef.current);
+      setDirHandle(handle);
+      const collected = await collectImagesRecursive(handle, "");
+      if (!collected.length) {
+        alert("No images found in that folder. Try a folder with .jpg/.png/.webp etc.");
+        setFiles([]);
+        setOrder([]);
+        setIdxInOrder(0);
+        setClassicSlots({ ...CLASSIC_SLOTS_INITIAL });
+        setIntervalsCompleted(0);
+        setIsRunning(false);
+        perImageSlideDataRef.current = {};
+        bareNonPencilMigrationVersionRef.current = PER_IMAGE_BARE_NON_PENCIL_VERSION;
+        undoStackByImageRef.current = {};
+        setUndoStackVersion((v) => v + 1);
+        prevSlideIdentityForAggregateRef.current = "";
+        prevImageStorageKeyForAggregateRef.current = "";
+        return;
+      }
+      setFolderLoadStatus(`Loading saved annotations… ${collected.length} images`);
+      const parsed = await readPerImageAggregateFromAppStorage();
+      let aggregate = parsed.images;
+      let bareVer = parsed.bareNonPencilMigrationVersion;
+      if (bareVer < PER_IMAGE_BARE_NON_PENCIL_VERSION) {
+        const { next } = resetNonPencilSlidesToBare(aggregate);
+        aggregate = next;
+        bareVer = PER_IMAGE_BARE_NON_PENCIL_VERSION;
+        writePerImageAggregateToAppStorage(aggregate, { bareNonPencilMigrationVersion: bareVer }).catch((err) =>
+          console.warn("gesture-slideshow: writing bare non-pencil migration failed", err)
+        );
+      }
+      setFolderLoadStatus("Merging saved data and preparing slideshow…");
+      const aggregateByHash: Record<string, PerImageSlideData> = {};
+      for (const fe of collected) {
+        const byHash = aggregate[fe.key];
+        const byLegacyPath = aggregate[fe.name];
+        if (byHash && byLegacyPath) {
+          aggregateByHash[fe.key] = pickRicherSlideData(byHash, byLegacyPath);
+        } else if (byHash) {
+          aggregateByHash[fe.key] = byHash;
+        } else if (byLegacyPath) {
+          aggregateByHash[fe.key] = byLegacyPath;
+        }
+      }
+      for (const [k, d] of Object.entries(aggregate)) {
+        if (!k.startsWith("sha256:") && !aggregateByHash[k]) continue;
+        if (!aggregateByHash[k]) aggregateByHash[k] = d;
+        else aggregateByHash[k] = pickRicherSlideData(aggregateByHash[k]!, d);
+      }
+      perImageSlideDataRef.current = aggregateByHash;
+      bareNonPencilMigrationVersionRef.current = bareVer;
+      undoStackByImageRef.current = {};
+      setUndoStackVersion((v) => v + 1);
+      prevSlideIdentityForAggregateRef.current = "";
+      prevImageStorageKeyForAggregateRef.current = "";
+      pencilStrokesByImageRef.current = {};
+      pencilDraftRef.current = null;
+      setPencilNonce((n) => n + 1);
+      setFiles(collected);
+      setOrder(orderWithoutAdjacentDuplicateHashes(collected, shuffle(collected.map((_, i) => i))));
       setIdxInOrder(0);
       setClassicSlots({ ...CLASSIC_SLOTS_INITIAL });
       setIntervalsCompleted(0);
       setIsRunning(false);
-      perImageSlideDataRef.current = {};
-      bareNonPencilMigrationVersionRef.current = PER_IMAGE_BARE_NON_PENCIL_VERSION;
-      undoStackByImageRef.current = {};
-      setUndoStackVersion((v) => v + 1);
-      prevImageKeyForAggregateRef.current = "";
-      return;
+    } finally {
+      setIsFolderLoading(false);
     }
-    const parsed = await readPerImageAggregateFromDirectory(handle);
-    let aggregate = parsed.images;
-    let bareVer = parsed.bareNonPencilMigrationVersion;
-    if (bareVer < PER_IMAGE_BARE_NON_PENCIL_VERSION) {
-      const { next } = resetNonPencilSlidesToBare(aggregate);
-      aggregate = next;
-      bareVer = PER_IMAGE_BARE_NON_PENCIL_VERSION;
-      writePerImageAggregateToDirectory(handle, aggregate, { bareNonPencilMigrationVersion: bareVer }).catch((err) =>
-        console.warn("gesture-slideshow: writing bare non-pencil migration failed", err)
-      );
-    }
-    perImageSlideDataRef.current = aggregate;
-    bareNonPencilMigrationVersionRef.current = bareVer;
-    undoStackByImageRef.current = {};
-    setUndoStackVersion((v) => v + 1);
-    prevImageKeyForAggregateRef.current = "";
-    pencilStrokesByImageRef.current = {};
-    pencilDraftRef.current = null;
-    setPencilNonce((n) => n + 1);
-    setFiles(collected);
-    setOrder(shuffle(collected.map((_, i) => i)));
-    setIdxInOrder(0);
-    setClassicSlots({ ...CLASSIC_SLOTS_INITIAL });
-    setIntervalsCompleted(0);
-    setIsRunning(false);
   }
 
   async function pickFolder() {
@@ -5345,7 +5554,7 @@ export default function Page() {
 
   function reshuffle() {
     if (!files.length) return;
-    setOrder(shuffle(files.map((_, i) => i)));
+    setOrder(orderWithoutAdjacentDuplicateHashes(files, shuffle(files.map((_, i) => i))));
     setIdxInOrder(0);
     setClassicSlots({ ...CLASSIC_SLOTS_INITIAL });
     setIntervalsCompleted(0);
@@ -5374,27 +5583,34 @@ export default function Page() {
     return perImageSlideDataRef.current[key] ?? null;
   }
 
-  /** Slides with markup, highest score first (ties: earlier in deck order). */
-  function getMarkedSlidesSortedByScore(): { orderIndex: number; score: number }[] {
+  /** Unique hashed slides with markup in current deck order (first occurrence per hash). */
+  function getMarkedSlidesInDeckOrder(): { orderIndex: number; score: number }[] {
     if (!files.length || !order.length) return [];
-    const scored = order.map((fileIndex, orderIndex) => {
+    const firstByKey = new Map<string, { orderIndex: number; score: number }>();
+    for (let orderIndex = 0; orderIndex < order.length; orderIndex++) {
+      const fileIndex = order[orderIndex]!;
       const fe = files[fileIndex];
-      if (!fe) return { orderIndex, score: 0 };
-      const data = getSlideDataForMarkupScore(fe.name);
-      return { orderIndex, score: data ? perImageMarkupScore(data) : 0 };
-    });
-    const marked = scored.filter((s) => s.score > 0);
-    marked.sort((a, b) => b.score - a.score || a.orderIndex - b.orderIndex);
-    return marked;
+      if (!fe) continue;
+      const data = getSlideDataForMarkupScore(fe.key);
+      const score = data ? perImageMarkupScore(data) : 0;
+      if (score <= 0) continue;
+      if (!firstByKey.has(fe.key)) firstByKey.set(fe.key, { orderIndex, score });
+    }
+    return Array.from(firstByKey.values()).sort((a, b) => a.orderIndex - b.orderIndex);
   }
 
   /** Jump among slides that have saved markup; cycles in order of most markup first (ties: deck order). */
   function goToNextMarkedUpSlide() {
     if (!order.length) return;
-    const marked = getMarkedSlidesSortedByScore();
+    const marked = getMarkedSlidesInDeckOrder();
     if (marked.length === 0) return;
+    setPencilVisibility(false);
     const cur = idxInOrder % order.length;
-    const i = marked.findIndex((s) => s.orderIndex === cur);
+    const curKey = files[order[cur] ?? -1]?.key ?? "";
+    const i = marked.findIndex((s) => {
+      const fileIndex = order[s.orderIndex];
+      return curKey && files[fileIndex ?? -1]?.key === curKey;
+    });
     if (i === -1) {
       setIdxInOrder(marked[0]!.orderIndex);
       return;
@@ -5402,10 +5618,11 @@ export default function Page() {
     setIdxInOrder(marked[(i + 1) % marked.length]!.orderIndex);
   }
 
-  /** Go to the #1 slide by markup score (restart the markup tour from the top). */
+  /** Restart the markup tour from the first marked slide in deck order. */
   function resetMarkupTourToTop() {
-    const marked = getMarkedSlidesSortedByScore();
+    const marked = getMarkedSlidesInDeckOrder();
     if (marked.length === 0) return;
+    setPencilVisibility(false);
     setIdxInOrder(marked[0]!.orderIndex);
   }
 
@@ -5480,7 +5697,7 @@ export default function Page() {
         .map((i) => (i > deletedIdx ? i - 1 : i));
 
       setFiles(newFiles);
-      setOrder(newOrder);
+      setOrder(orderWithoutAdjacentDuplicateHashes(newFiles, newOrder));
       setIdxInOrder((v) => Math.min(v, Math.max(0, newOrder.length - 1)));
       if (newFiles.length === 0) {
         revokeSlidePrefetchMap(slidePrefetchRef.current);
@@ -5581,6 +5798,7 @@ export default function Page() {
           return;
         }
         const file = await currentFile.handle.getFile();
+        setCurrentUrlSlideIdentity(currentFile.name);
         currentUrlRef.current = prefetched;
         setCurrentUrl(prefetched);
         setImageMeta((prev) => ({
@@ -5606,6 +5824,7 @@ export default function Page() {
         return;
       }
 
+      setCurrentUrlSlideIdentity(currentFile.name);
       currentUrlRef.current = url;
       setCurrentUrl(url);
       setImageMeta((prev) => ({
@@ -5883,7 +6102,7 @@ export default function Page() {
         return;
       }
 
-      // M: markup tour — next slide by markup rank (ignore with Ctrl/Cmd).
+      // M: markup tour — next marked slide in deck order (ignore with Ctrl/Cmd).
       if (!isTextField && e.code === "KeyM" && !e.ctrlKey && !e.metaKey) {
         if (!currentUrl) return;
         if (e.repeat) return;
@@ -6033,12 +6252,13 @@ export default function Page() {
       case "imageInfo":
         if (!currentFile) return null;
         {
-          const markupData = getSlideDataForMarkupScore(currentFile.name);
+          const markupData = getSlideDataForMarkupScore(currentFile.key);
           const markupScore = markupData != null ? perImageMarkupScore(markupData) : 0;
           return (
             <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
               <MetaRow label="File name" value={currentFile.name.split("/").pop() ?? currentFile.name} />
               <MetaRow label="Path" value={currentFile.name} />
+              <MetaRow label="Image hash" value={currentFile.key || "—"} />
               <MetaRow label="File size" value={imageMeta.fileSize != null ? formatBytes(imageMeta.fileSize) : "—"} />
               <MetaRow
                 label="Resolution"
@@ -6063,6 +6283,49 @@ export default function Page() {
             </div>
           );
         }
+      case "imagePlacement":
+        return (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 12, opacity: 0.9 }}>
+              <input
+                type="checkbox"
+                checked={imagePlacementEnabled}
+                onChange={(e) => setImagePlacementEnabled(e.target.checked)}
+              />
+              <span>Enable image placement</span>
+            </label>
+            <div style={{ display: "flex", gap: 6 }}>
+              {(["left", "center", "right"] as const).map((option) => {
+                const active = imagePlacement === option;
+                return (
+                  <button
+                    key={option}
+                    type="button"
+                    onClick={() => setImagePlacement(option)}
+                    disabled={!imagePlacementEnabled}
+                    style={{
+                      flex: 1,
+                      padding: "6px 8px",
+                      fontSize: 12,
+                      borderRadius: 6,
+                      border: "1px solid rgba(255,255,255,0.2)",
+                      background: active ? "rgba(255,255,255,0.18)" : "rgba(255,255,255,0.07)",
+                      color: "white",
+                      cursor: imagePlacementEnabled ? "pointer" : "not-allowed",
+                      opacity: imagePlacementEnabled ? 1 : 0.5,
+                      textTransform: "capitalize",
+                    }}
+                  >
+                    {option}
+                  </button>
+                );
+              })}
+            </div>
+            <p style={{ margin: 0, fontSize: 11, lineHeight: 1.4, opacity: 0.78 }}>
+              Center is the default. Enable this to place slides against the left or right side of the canvas.
+            </p>
+          </div>
+        );
       case "grid":
         return (
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -6109,10 +6372,10 @@ export default function Page() {
         const hideAllOvalsDisabled =
           files.length === 0 ||
           files.every((fe) => {
-            if (fe.name === currentImageKey) {
+            if (fe.key === currentImageKey) {
               return !showOval && extraOvals.length === 0;
             }
-            const d = perImageSlideDataRef.current[fe.name] ?? defaultPerImageSlideData();
+            const d = perImageSlideDataRef.current[fe.key] ?? defaultPerImageSlideData();
             return !d.showOval && (d.extraOvals?.length ?? 0) === 0;
           });
         return (
@@ -6137,9 +6400,9 @@ export default function Page() {
               onClick={() => {
                 pushUndoSnapshotRef.current();
                 for (const fe of files) {
-                  const prev = perImageSlideDataRef.current[fe.name];
+                  const prev = perImageSlideDataRef.current[fe.key];
                   const base = prev ?? defaultPerImageSlideData();
-                  perImageSlideDataRef.current[fe.name] = {
+                  perImageSlideDataRef.current[fe.key] = {
                     ...base,
                     showOval: false,
                     extraOvals: [],
@@ -6480,7 +6743,7 @@ export default function Page() {
             </div>
             <p style={{ margin: 0, fontSize: 11, lineHeight: 1.45, opacity: 0.78 }}>
               Draw on the current slide; enable Move all to drag every pencil mark on this image together. Strokes are kept per image and saved with overlay layout in{" "}
-              <code style={{ fontSize: 10 }}>{PER_IMAGE_AGGREGATE_FILENAME}</code> in the opened folder.
+              <code style={{ fontSize: 10 }}>{PER_IMAGE_AGGREGATE_FILENAME}</code> in the app folder.
             </p>
           </div>
         );
@@ -6513,7 +6776,7 @@ export default function Page() {
               Strokes on this slide{key ? ` (${currentFile?.name.split("/").pop() ?? key})` : ""}. Updates when you finish a stroke, undo, clear, or change slide.
             </p>
             <label style={{ display: "flex", flexDirection: "column", gap: 3, fontSize: 11, opacity: 0.9 }}>
-              <span>Advance after N strokes (0 = off). One stroke past N clears all marks on this slide.</span>
+              <span>Advance after N strokes (0 = off).</span>
               <input
                 type="number"
                 inputMode="numeric"
@@ -6539,8 +6802,16 @@ export default function Page() {
                 }}
               />
             </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 11, opacity: 0.9 }}>
+              <input
+                type="checkbox"
+                checked={strokeAdvanceDeleteMarks}
+                onChange={(e) => setStrokeAdvanceDeleteMarks(e.target.checked)}
+              />
+              <span>Delete this slide&apos;s pencil marks before auto-advance</span>
+            </label>
             <p style={{ margin: 0, fontSize: 10, lineHeight: 1.35, opacity: 0.65 }}>
-              When you finish a stroke (lift the pointer) and the count reaches exactly N, the deck advances to the next image after that line is drawn — not while the stroke is still in progress.
+              When you finish a stroke (lift the pointer) and the count reaches exactly N, the deck advances to the next image after that line is drawn — not while the stroke is still in progress. Turn off delete to keep marks on this slide.
             </p>
           </div>
         );
@@ -6567,6 +6838,8 @@ export default function Page() {
                 setImageGrayscale(0);
                 setImageSaturation(1);
                 setImageBlur(0);
+                setImagePlacementEnabled(DEFAULT_SETTINGS.imagePlacementEnabled);
+                setImagePlacement(DEFAULT_SETTINGS.imagePlacement);
                 setPencilEnabled(DEFAULT_SETTINGS.pencilEnabled);
                 setPencilSize(DEFAULT_SETTINGS.pencilSize);
                 setPencilColor(DEFAULT_SETTINGS.pencilColor);
@@ -6636,6 +6909,7 @@ export default function Page() {
   function isExpanded(sectionId: SidebarSectionId): boolean {
     switch (sectionId) {
       case "imageInfo": return imageInfoExpanded;
+      case "imagePlacement": return imagePlacementExpanded;
       case "grid": return gridExpanded;
       case "centerFrame": return centerFrameExpanded;
       case "oval": return ovalExpanded;
@@ -6653,6 +6927,7 @@ export default function Page() {
   function setExpanded(sectionId: SidebarSectionId, next: boolean) {
     switch (sectionId) {
       case "imageInfo": setImageInfoExpanded(next); break;
+      case "imagePlacement": setImagePlacementExpanded(next); break;
       case "grid": setGridExpanded(next); break;
       case "centerFrame": setCenterFrameExpanded(next); break;
       case "oval": setOvalExpanded(next); break;
@@ -6797,6 +7072,39 @@ export default function Page() {
         overflow: currentUrl ? "hidden" : "visible",
       }}
     >
+      {isFolderLoading ? (
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            zIndex: 2000,
+            background: "rgba(8,12,20,0.72)",
+            backdropFilter: "blur(2px)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            pointerEvents: "auto",
+          }}
+        >
+          <div
+            style={{
+              minWidth: 280,
+              maxWidth: 520,
+              padding: "14px 16px",
+              borderRadius: 10,
+              border: "1px solid rgba(255,255,255,0.18)",
+              background: "rgba(12,20,35,0.9)",
+              boxShadow: "0 8px 26px rgba(0,0,0,0.35)",
+              display: "flex",
+              flexDirection: "column",
+              gap: 8,
+            }}
+          >
+            <div style={{ fontSize: 13, fontWeight: 600, opacity: 0.96 }}>Loading folder…</div>
+            <div style={{ fontSize: 12, opacity: 0.8 }}>{folderLoadStatus || "Working…"}</div>
+          </div>
+        </div>
+      ) : null}
       {!currentUrl ? (
         // Landing page
         <div
@@ -6879,27 +7187,27 @@ export default function Page() {
           >
             <button
               onClick={openLastFolder}
-              disabled={!supported || !lastFolderName}
+              disabled={!supported || !lastFolderName || isFolderLoading}
               style={{
-                ...btn(!supported || !lastFolderName),
+                ...btn(!supported || !lastFolderName || isFolderLoading),
                 padding: "14px 28px",
                 fontSize: 16,
                 fontWeight: 600,
               }}
             >
-              Open Last
+              {isFolderLoading ? "Loading…" : "Open Last"}
             </button>
             <button
               onClick={pickFolder}
-              disabled={!supported}
+              disabled={!supported || isFolderLoading}
               style={{
-                ...btn(!supported),
+                ...btn(!supported || isFolderLoading),
                 padding: "14px 28px",
                 fontSize: 16,
                 fontWeight: 600,
               }}
             >
-              Pick Folder
+              {isFolderLoading ? "Loading…" : "Pick Folder"}
             </button>
           </div>
           {lastFolderName ? (
@@ -7032,10 +7340,10 @@ export default function Page() {
           >
             <button
               onClick={pickFolder}
-              disabled={!supported}
-              style={{ ...btn(!supported), pointerEvents: showOverlays ? "auto" : "none" }}
+              disabled={!supported || isFolderLoading}
+              style={{ ...btn(!supported || isFolderLoading), pointerEvents: showOverlays ? "auto" : "none" }}
             >
-              {dirHandle ? "Change Folder" : "Pick Folder"}
+              {isFolderLoading ? "Loading…" : dirHandle ? "Change Folder" : "Pick Folder"}
             </button>
 
             <button
@@ -7056,7 +7364,7 @@ export default function Page() {
                 padding: "6px 10px",
                 pointerEvents: showOverlays ? "auto" : "none",
               }}
-              title="Jump through images with saved markup (pencil, extra ovals, shapes, pan/zoom, adjustments). Visits the heaviest edits first, then cycles. Skips images with no saved changes. Keyboard: M."
+              title="Jump through images with saved markup (pencil, extra ovals, shapes, pan/zoom, adjustments) in deck order. Skips images with no saved changes and dedupes repeated files with the same image hash. Keyboard: M."
             >
               Markup
             </button>
@@ -7071,7 +7379,7 @@ export default function Page() {
                 padding: "6px 10px",
                 pointerEvents: showOverlays ? "auto" : "none",
               }}
-              title="Jump to the slide with the most saved markup (rank #1). Restarts the markup tour from the top."
+              title="Jump to the first marked slide in deck order. Restarts the markup tour from the top."
             >
               Markup reset
             </button>
@@ -7214,7 +7522,7 @@ export default function Page() {
                 flex: 1,
                 display: "flex",
                 alignItems: "center",
-                justifyContent: "center",
+                justifyContent: imagePlacementJustify,
                 minWidth: 0,
                 minHeight: 0,
                 overflow: "hidden",
@@ -7235,7 +7543,7 @@ export default function Page() {
                   maxHeight: "100%",
                   display: "flex",
                   alignItems: "center",
-                  justifyContent: "center",
+                  justifyContent: imagePlacementJustify,
                   transform: imageComposeTransform,
                   transformOrigin: "center center",
                   cursor: isPanning
@@ -7288,6 +7596,10 @@ export default function Page() {
                     draggable={false}
                     onLoad={(e) => {
                       const img = e.currentTarget;
+                      setPencilVisibility(false);
+                      setMainImageHidden(false);
+                      setLoadedImageUrl(img.currentSrc || currentUrl);
+                      setLoadedSlideIdentity(currentSlideIdentity || null);
                       setImageMeta((prev) => ({
                         ...prev,
                         width: img.naturalWidth,
@@ -7343,6 +7655,8 @@ export default function Page() {
                     touchAction: "none",
                     cursor: pencilEnabled ? (pencilMoveAllMode ? "grab" : PENCIL_TOOL_CURSOR) : "default",
                     zIndex: 6,
+                    opacity: pencilCanvasVisible ? 1 : 0,
+                    transition: "opacity 90ms linear",
                   }}
                 />
               </div>
@@ -8191,11 +8505,11 @@ export default function Page() {
                           regionTitle={`2 back: ${hudNeighborFiles.p0.name.split("/").pop() ?? hudNeighborFiles.p0.name}`}
                           minimized={prevHudMinimized}
                           onToggleMinimized={() => setPrevHudMinimized((m) => !m)}
-                          strokes={strokesForHudNeighborImage(hudNeighborFiles.p0.name)}
+                          strokes={strokesForHudNeighborImage(hudNeighborFiles.p0.key)}
                           pencilRevision={pencilNonce + undoStackVersion}
                           corner="left"
                           onPickSlide={() => goToHudNeighborFile(hudNeighborFiles.p0)}
-                          pencilStrokesUv={perImageSlideDataRef.current[hudNeighborFiles.p0.name]?.pencilStrokesUv ?? true}
+                          pencilStrokesUv={perImageSlideDataRef.current[hudNeighborFiles.p0.key]?.pencilStrokesUv ?? true}
                         />
                       ) : null}
                       {hudNeighborFiles.p1 && hudNeighborUrls.p1 ? (
@@ -8209,11 +8523,11 @@ export default function Page() {
                           regionTitle={`1 back: ${hudNeighborFiles.p1.name.split("/").pop() ?? hudNeighborFiles.p1.name}`}
                           minimized={prevHudMinimized}
                           onToggleMinimized={() => setPrevHudMinimized((m) => !m)}
-                          strokes={strokesForHudNeighborImage(hudNeighborFiles.p1.name)}
+                          strokes={strokesForHudNeighborImage(hudNeighborFiles.p1.key)}
                           pencilRevision={pencilNonce + undoStackVersion}
                           corner="left"
                           onPickSlide={() => goToHudNeighborFile(hudNeighborFiles.p1)}
-                          pencilStrokesUv={perImageSlideDataRef.current[hudNeighborFiles.p1.name]?.pencilStrokesUv ?? true}
+                          pencilStrokesUv={perImageSlideDataRef.current[hudNeighborFiles.p1.key]?.pencilStrokesUv ?? true}
                         />
                       ) : null}
                       {renderBottomHudChromeToggle({ alignSelf: prevHudMinimized ? "center" : "flex-start" })}
@@ -8254,11 +8568,11 @@ export default function Page() {
                           regionTitle={`Next: ${hudNeighborFiles.n0.name.split("/").pop() ?? hudNeighborFiles.n0.name}`}
                           minimized={nextHudMinimized}
                           onToggleMinimized={() => setNextHudMinimized((m) => !m)}
-                          strokes={strokesForHudNeighborImage(hudNeighborFiles.n0.name)}
+                          strokes={strokesForHudNeighborImage(hudNeighborFiles.n0.key)}
                           pencilRevision={pencilNonce + undoStackVersion}
                           corner="right"
                           onPickSlide={() => goToHudNeighborFile(hudNeighborFiles.n0)}
-                          pencilStrokesUv={perImageSlideDataRef.current[hudNeighborFiles.n0.name]?.pencilStrokesUv ?? true}
+                          pencilStrokesUv={perImageSlideDataRef.current[hudNeighborFiles.n0.key]?.pencilStrokesUv ?? true}
                         />
                       ) : null}
                       {hudNeighborFiles.n1 && hudNeighborUrls.n1 ? (
@@ -8272,11 +8586,11 @@ export default function Page() {
                           regionTitle={`2 ahead: ${hudNeighborFiles.n1.name.split("/").pop() ?? hudNeighborFiles.n1.name}`}
                           minimized={nextHudMinimized}
                           onToggleMinimized={() => setNextHudMinimized((m) => !m)}
-                          strokes={strokesForHudNeighborImage(hudNeighborFiles.n1.name)}
+                          strokes={strokesForHudNeighborImage(hudNeighborFiles.n1.key)}
                           pencilRevision={pencilNonce + undoStackVersion}
                           corner="right"
                           onPickSlide={() => goToHudNeighborFile(hudNeighborFiles.n1)}
-                          pencilStrokesUv={perImageSlideDataRef.current[hudNeighborFiles.n1.name]?.pencilStrokesUv ?? true}
+                          pencilStrokesUv={perImageSlideDataRef.current[hudNeighborFiles.n1.key]?.pencilStrokesUv ?? true}
                         />
                       ) : null}
                     </div>

@@ -1,6 +1,15 @@
-export const APP_VERSION = "0.6.1";
+export const APP_VERSION = "0.6.2";
 
 export const VERSION_HISTORY: { version: string; date: string; changes: string[] }[] = [
+  {
+    version: "0.6.2",
+    date: "2026-04-25",
+    changes: [
+      "New Image placement sidebar section with an enable toggle and Left/Center/Right positioning controls",
+      "Center remains the default slide alignment, and enabling placement allows pinning the slide to the left or right side of the canvas",
+      "Image placement preference is persisted in settings and included in Reset all behavior",
+    ],
+  },
   {
     version: "0.6.1",
     date: "2026-04-21",
